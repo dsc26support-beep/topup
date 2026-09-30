@@ -1,6 +1,20 @@
 /**
- * Kiribati recharge system — backend Web App (v27)
+ * Kiribati recharge system — backend Web App (v28)
  * ---------------------------------------------------
+ * Change from v27: NEW CHECK -- looksLikeUnsubmittedTransferScreen()
+ * catches a "Transfer Confirmation" screen (the review step a banking
+ * app shows BEFORE the customer taps Confirm) submitted as if it were
+ * proof of payment. That screen already failed ocrContainsSuccessWord()
+ * incidentally (its regex needs "confirmed", past tense, which a
+ * pre-submit screen doesn't say), but that was never a deliberate
+ * guarantee -- a bank whose pre-submit screen happens to also say
+ * "Confirmed" would have slipped through. This is now an explicit, hard
+ * check: flags either the literal title "Transfer Confirmation", or a
+ * "Confirm"/"Cancel" button pair with no "Confirmed" anywhere (the
+ * unmistakable signature of a not-yet-submitted screen). Either forces
+ * looksValid false -> Rejected, same as any other hard-fail check,
+ * recorded in OCR Notes as "Not yet submitted:true/false".
+ *
  * Change from v26: bank account number changed back from 906149 to
  * 786149 -- updates ACCOUNT_NUMBER, which the OCR check matches
  * against the screenshot text. Also updated on the frontend (main pay
@@ -462,9 +476,11 @@ function doPost(e) {
 
     const bankRefCheck = checkBankReferenceNumber(ocrText);
     const refIssued = isReferenceIssuedByUs(reference);
+    const isUnsubmittedScreen = looksLikeUnsubmittedTransferScreen(ocrText);
 
     const looksValid = refMatched && amountMatched && acctMatched &&
-      successMatched && bankMatched && recency.ok && bankRefCheck.ok;
+      successMatched && bankMatched && recency.ok && bankRefCheck.ok &&
+      !isUnsubmittedScreen;
 
     const props = PropertiesService.getScriptProperties();
     const autoMax = Number(props.getProperty("AUTO_APPROVE_MAX") || "0");
@@ -490,6 +506,7 @@ function doPost(e) {
     const notes = [
       "Ref:" + refMatched, "Cost:" + amountMatched, "Acct:" + acctMatched,
       "Success word:" + successMatched, "Bank name:" + bankMatched,
+      "Not yet submitted:" + isUnsubmittedScreen,
       "Recency:" + recency.ok + " (" + recency.note + ")",
       "Exif:" + isLikelyPhoto,
       "Paid:" + (amountCheck.paidAmount !== null ? amountCheck.paidAmount.toFixed(2) : "n/a"),
@@ -784,6 +801,26 @@ function advanceLastBankRefSeq(seq) {
 
 function ocrContainsSuccessWord(ocrText) {
   return /(successful|completed|confirmed|approved|receipt|success|posted)/i.test(ocrText);
+}
+
+// Catches a "Transfer Confirmation" screen -- the review/confirm step a
+// banking app shows BEFORE the customer taps Confirm, not proof the
+// transfer actually happened. It already fails ocrContainsSuccessWord()
+// above (that regex needs "confirmed", past tense, which this screen
+// doesn't say), so it's already caught today -- but that's incidental,
+// not intentional: a bank whose pre-submit screen happens to also say
+// "Confirmed" would slip through. This is an explicit, second check so
+// the block doesn't depend on which words a particular bank's UI
+// happens to avoid: it flags the "Confirm"/"Cancel" button pair (the
+// unmistakable signature of a not-yet-submitted screen) and the literal
+// title "Transfer Confirmation", either of which is a hard fail
+// regardless of what else matches.
+function looksLikeUnsubmittedTransferScreen(ocrText) {
+  const text = ocrText.toLowerCase();
+  if (/transfer confirmation/.test(text)) return true;
+  const hasConfirmButton = /\bconfirm\b/.test(text) && !/confirmed/.test(text);
+  const hasCancelButton = /\bcancel\b/.test(text);
+  return hasConfirmButton && hasCancelButton;
 }
 
 function ocrContainsBankKeyword(ocrText) {
