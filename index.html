@@ -326,7 +326,7 @@
 <div class="modal-overlay" id="voucher-sent-overlay">
   <div class="modal-box" style="text-align: center;">
     <h2>Email sent!</h2>
-    <p>Your recharge code has been emailed to you. Copy the dial code below to top up right away.</p>
+    <p id="voucher-sent-instruction">Your recharge code has been emailed to you. Copy the dial code below to top up right away.</p>
     <div class="detail-row">
       <div class="detail-main">
         <div class="detail-label">Dial to Top Up</div>
@@ -621,12 +621,17 @@
   // now returns directly in the response (v29) instead of making the
   // customer wait for the email to show up.
   const voucherSentOverlay = document.getElementById("voucher-sent-overlay");
+  const voucherSentInstruction = document.getElementById("voucher-sent-instruction");
   const voucherDialValue = document.getElementById("voucher-dial-value");
   const voucherDialBtn = document.getElementById("voucher-dial-btn");
+
+  const VOUCHER_INSTRUCTION_BEFORE_COPY = "Your recharge code has been emailed to you. Copy the dial code below to top up right away.";
+  const VOUCHER_INSTRUCTION_AFTER_COPY = "Copied! Tap Call below to dial and paste your code automatically.";
 
   function showVoucherSentPopup(voucherCode) {
     const dialString = "*111*" + voucherCode + "#";
     voucherDialValue.textContent = dialString;
+    voucherSentInstruction.textContent = VOUCHER_INSTRUCTION_BEFORE_COPY;
     voucherDialBtn.textContent = "Copy";
     voucherDialBtn.classList.remove("green");
     voucherDialBtn.dataset.copied = "false";
@@ -640,6 +645,7 @@
         voucherDialBtn.dataset.copied = "true";
         voucherDialBtn.textContent = "Call";
         voucherDialBtn.classList.add("green");
+        voucherSentInstruction.textContent = VOUCHER_INSTRUCTION_AFTER_COPY;
       });
     } else {
       window.location.href = "tel:" + dialString.replace("#", "%23");
