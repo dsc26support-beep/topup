@@ -334,7 +334,7 @@
     <div class="detail-row">
       <div class="detail-main">
         <div class="detail-label">Account Number</div>
-        <div class="detail-value">906149</div>
+        <div class="detail-value">786149</div>
       </div>
       <button type="button" class="copy-btn yellow inline" id="before-pay-copy-acct-btn">Copy</button>
     </div>
@@ -362,7 +362,7 @@
   // Replace with your deployed Apps Script Web App URL (ends in /exec)
   const BACKEND_URL = "https://script.google.com/macros/s/AKfycbzsVG28G1xvNkA5gqLVTDw6qtM7SSnacp4lGklef1AEneNwulpTPNPNciLke-pRA3LR/exec";
 
-  const ACCOUNT_NUMBER = "906149";
+  const ACCOUNT_NUMBER = "786149";
 
   // Top-up value -> amount the buyer actually pays (includes fee).
   const PRICING = [
@@ -590,7 +590,7 @@
     beforePayError.style.display = "none";
   });
   wireCopyButton("before-pay-copy-name-btn", () => "Nei Recharge");
-  wireCopyButton("before-pay-copy-acct-btn", () => "906149");
+  wireCopyButton("before-pay-copy-acct-btn", () => "786149");
   wireCopyButton("before-pay-copy-cost-btn", () => (currentCost !== null ? currentCost.toFixed(2) : ""));
   document.getElementById("before-pay-copy-cost-btn").addEventListener("click", () => {
     payCopied = true;

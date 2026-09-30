@@ -1,6 +1,17 @@
 /**
- * Kiribati recharge system — backend Web App (v26)
+ * Kiribati recharge system — backend Web App (v27)
  * ---------------------------------------------------
+ * Change from v26: bank account number changed back from 906149 to
+ * 786149 -- updates ACCOUNT_NUMBER, which the OCR check matches
+ * against the screenshot text. Also updated on the frontend (main pay
+ * box, "before you pay" popup, and the client-side OCR pre-check's
+ * ACCOUNT_NUMBER constant). IMPORTANT: same cutover caveat as the v21
+ * account-number change -- any in-flight screenshots taken before this
+ * redeploy will show the OLD (906149) number and fail the Acct check
+ * under the new rule; expect a short window of Rejected/Pending rows
+ * around the cutover, approve those manually if the payment is
+ * genuine.
+ *
  * Change from v25: the customer voucher email (both
  * sendStandardVoucherEmail() and sendTipEmail()) now also shows the
  * submission's "Reference to Recipient" alongside the Recharge Card
@@ -259,7 +270,7 @@ const VOUCHERS_SHEET_NAME = "Vouchers";
 const ARCHIVE_SHEET_NAME = "Archive";
 const USED_VOUCHERS_SHEET_NAME = "Used Vouchers";
 const REFERENCE_SHEET_NAME = "Reference";
-const ACCOUNT_NUMBER = "906149";
+const ACCOUNT_NUMBER = "786149";
 
 const COL = {
   TIMESTAMP: 1, REFERENCE: 2, NAME: 3, EMAIL: 4,
