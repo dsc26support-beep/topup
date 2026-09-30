@@ -1,6 +1,17 @@
 /**
- * Kiribati recharge system — backend Web App (v28)
+ * Kiribati recharge system — backend Web App (v29)
  * ---------------------------------------------------
+ * Change from v28: doPost()'s "approved" response now also includes
+ * voucherCode (the same code just emailed), so the frontend can show
+ * it immediately in an on-page popup with a copy/dial button, instead
+ * of making the customer wait for email. This is a deliberate change
+ * in what the API response exposes -- the code is now visible in the
+ * browser (dev tools/network tab), not just delivered via email -- but
+ * it's the same recipient who just submitted the payment, so the risk
+ * is low. processApprovedRow() now returns { sent, code } instead of a
+ * bare boolean; its other caller (onStatusEdit(), manual approval)
+ * ignores the return value already, so it needed no change.
+ *
  * Change from v27: NEW CHECK -- looksLikeUnsubmittedTransferScreen()
  * catches a "Transfer Confirmation" screen (the review step a banking
  * app shows BEFORE the customer taps Confirm) submitted as if it were
@@ -534,11 +545,12 @@ function doPost(e) {
     }
 
     if (eligibleForAuto) {
-      const sent = processApprovedRow(row);
+      const result = processApprovedRow(row);
       return jsonResponse({
-        status: sent ? "approved" : "pending",
-        message: sent ? "Auto-approved and email sent." : "Auto-approval passed but no matching vouchers left.",
+        status: result.sent ? "approved" : "pending",
+        message: result.sent ? "Auto-approved and email sent." : "Auto-approval passed but no matching vouchers left.",
         underTolerance: amountCheck.underTolerance,
+        voucherCode: result.sent ? result.code : null,
       });
     }
 
@@ -921,12 +933,12 @@ function processApprovedRow(row) {
   const ocrNotes = String(sheet.getRange(row, COL.OCR_NOTES).getValue() || "");
   const voucherSentCell = sheet.getRange(row, COL.VOUCHER_SENT);
 
-  if (voucherSentCell.getValue()) return true;
+  if (voucherSentCell.getValue()) return { sent: true, code: null };
 
   const voucher = claimNextVoucher(topupAmount);
   if (!voucher) {
     voucherSentCell.setValue("ERROR: no $" + topupAmount + " vouchers left");
-    return false;
+    return { sent: false, code: null };
   }
 
   const tipMatch = ocrNotes.match(/Tip:([0-9]+\.[0-9]{2})/);
@@ -941,11 +953,11 @@ function processApprovedRow(row) {
     voucherSentCell.setValue(voucher.code + " (emailed)");
     archiveRow(row);
     archiveUsedVoucher(voucher.rowIndex);
-    return true;
+    return { sent: true, code: voucher.code };
   } catch (err) {
     voucherSentCell.setValue("ERROR: " + err.message);
     markVoucherUnused(voucher.rowIndex);
-    return false;
+    return { sent: false, code: null };
   }
 }
 

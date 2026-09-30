@@ -65,6 +65,9 @@
   .copy-btn.yellow {
     background: var(--warn-border); border-color: var(--warn-border); color: #1a1a1a; font-weight: 600;
   }
+  .copy-btn.green {
+    background: var(--success); border-color: var(--success); color: #fff; font-weight: 600;
+  }
   .copy-btn.inline { display: inline-block; margin: 0; }
   label { display: block; font-weight: 600; font-size: 0.9rem; margin: 16px 0 6px; }
   label.label-with-info { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
@@ -320,6 +323,21 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="voucher-sent-overlay">
+  <div class="modal-box" style="text-align: center;">
+    <h2>Email sent!</h2>
+    <p>Your recharge code has been emailed to you. Copy the dial code below to top up right away.</p>
+    <div class="detail-row">
+      <div class="detail-main">
+        <div class="detail-label">Dial to Top Up</div>
+        <div class="detail-value" id="voucher-dial-value">—</div>
+      </div>
+      <button type="button" class="copy-btn yellow inline" id="voucher-dial-btn">Copy</button>
+    </div>
+    <button type="button" class="ok-btn" id="voucher-sent-ok">Exit</button>
+  </div>
+</div>
+
 <div class="modal-overlay" id="before-pay-overlay">
   <div class="modal-box confirm-box">
     <h2>Copy/Paste to Bank App</h2>
@@ -570,6 +588,7 @@
       screenshotInfoOverlay.classList.remove("open");
       beforePayOverlay.classList.remove("open");
       document.getElementById("screenshot-preview-overlay").classList.remove("open");
+      document.getElementById("voucher-sent-overlay").classList.remove("open");
       if (hourReminderOverlay.classList.contains("open")) dismissHourReminder();
     }
   });
@@ -595,6 +614,43 @@
   document.getElementById("before-pay-copy-cost-btn").addEventListener("click", () => {
     payCopied = true;
     beforePayError.style.display = "none";
+  });
+
+  // "Email sent" popup with a Copy -> Call dial-code button. Shown right
+  // after an auto-approved submission, using the voucher code the backend
+  // now returns directly in the response (v29) instead of making the
+  // customer wait for the email to show up.
+  const voucherSentOverlay = document.getElementById("voucher-sent-overlay");
+  const voucherDialValue = document.getElementById("voucher-dial-value");
+  const voucherDialBtn = document.getElementById("voucher-dial-btn");
+
+  function showVoucherSentPopup(voucherCode) {
+    const dialString = "*111*" + voucherCode + "#";
+    voucherDialValue.textContent = dialString;
+    voucherDialBtn.textContent = "Copy";
+    voucherDialBtn.classList.remove("green");
+    voucherDialBtn.dataset.copied = "false";
+    voucherSentOverlay.classList.add("open");
+  }
+
+  voucherDialBtn.addEventListener("click", () => {
+    const dialString = voucherDialValue.textContent;
+    if (voucherDialBtn.dataset.copied !== "true") {
+      navigator.clipboard.writeText(dialString).then(() => {
+        voucherDialBtn.dataset.copied = "true";
+        voucherDialBtn.textContent = "Call";
+        voucherDialBtn.classList.add("green");
+      });
+    } else {
+      window.location.href = "tel:" + dialString.replace("#", "%23");
+    }
+  });
+
+  document.getElementById("voucher-sent-ok").addEventListener("click", () => {
+    voucherSentOverlay.classList.remove("open");
+  });
+  voucherSentOverlay.addEventListener("click", (e) => {
+    if (e.target === voucherSentOverlay) voucherSentOverlay.classList.remove("open");
   });
 
   const screenshotInput = document.getElementById("screenshot");
@@ -840,6 +896,7 @@
           (result.underTolerance ? '<span class="underpay-note">Koa kai kakoroa n ae ena roko.</span>' : "");
         statusEl.className = "success";
         saveContactInfo(payload.name, payload.email);
+        if (result.voucherCode) showVoucherSentPopup(result.voucherCode);
         form.reset();
         costDisplay.classList.remove("show");
         resetScreenshotUI();
