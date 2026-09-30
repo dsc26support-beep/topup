@@ -1,6 +1,13 @@
 /**
- * Kiribati recharge system — backend Web App (v25)
+ * Kiribati recharge system — backend Web App (v26)
  * ---------------------------------------------------
+ * Change from v25: the customer voucher email (both
+ * sendStandardVoucherEmail() and sendTipEmail()) now also shows the
+ * submission's "Reference to Recipient" alongside the Recharge Card
+ * Number, so the customer has it on record for support/dispute
+ * purposes without needing to dig up their own copy. Sender display
+ * name simplified from "AM TOPUP (No-Reply)" to "AM TOPUP".
+ *
  * Change from v24: doPost() was only rate-limited per email
  * (RATE_LIMIT_PER_HOUR), trivially bypassed with throwaway addresses --
  * and every submission spends shared account quota regardless of which
@@ -855,10 +862,11 @@ function appendResponseRow(data) {
 
 // ---- Voucher assignment + email send ----
 
-const EMAIL_SENDER_NAME = "AM TOPUP (No-Reply)";
+const EMAIL_SENDER_NAME = "AM TOPUP";
 
 function processApprovedRow(row) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RESPONSES_SHEET_NAME);
+  const reference = sheet.getRange(row, COL.REFERENCE).getValue();
   const name = sheet.getRange(row, COL.NAME).getValue();
   const email = sheet.getRange(row, COL.EMAIL).getValue();
   const topupAmount = sheet.getRange(row, COL.TOPUP_AMOUNT).getValue();
@@ -878,9 +886,9 @@ function processApprovedRow(row) {
 
   try {
     if (tipAmount > 0) {
-      sendTipEmail(email, name, topupAmount, voucher.code, tipAmount);
+      sendTipEmail(email, name, topupAmount, voucher.code, tipAmount, reference);
     } else {
-      sendStandardVoucherEmail(email, name, topupAmount, voucher.code);
+      sendStandardVoucherEmail(email, name, topupAmount, voucher.code, reference);
     }
     voucherSentCell.setValue(voucher.code + " (emailed)");
     archiveRow(row);
@@ -965,10 +973,11 @@ function buildEmailFooterPlainText() {
   );
 }
 
-function sendStandardVoucherEmail(email, name, topupAmount, code) {
+function sendStandardVoucherEmail(email, name, topupAmount, code, reference) {
   const plainBody =
     "Hi " + name + ",\n\n" +
     "Your $" + topupAmount + " top-up is confirmed.\n\n" +
+    "Reference to Recipient: " + reference + "\n\n" +
     "This is your Recharge Card Number:\n" +
     code + "\n\n" +
     "Ko rabwa\nNei Recharge.\n" +
@@ -978,6 +987,8 @@ function sendStandardVoucherEmail(email, name, topupAmount, code) {
     '<div style="font-family:sans-serif;max-width:420px;margin:0 auto;padding:24px;">' +
     '<p>Hi ' + name + ',</p>' +
     '<p>Your $' + topupAmount + ' top-up is confirmed.</p>' +
+    '<p style="font-size:0.9rem;color:#6b7280;margin-bottom:4px;">Reference to Recipient</p>' +
+    '<p style="font-size:1.1rem;font-weight:700;letter-spacing:2px;margin-top:0;">' + reference + '</p>' +
     '<p style="font-size:0.9rem;color:#6b7280;margin-bottom:4px;">This is your Recharge Card Number</p>' +
     '<p style="font-size:1.3rem;font-weight:700;letter-spacing:2px;">' + code + '</p>' +
     '<p>Ko rabwa<br>Nei Recharge.</p>' +
@@ -992,14 +1003,16 @@ function sendStandardVoucherEmail(email, name, topupAmount, code) {
 
 const TIP_CELEBRATION_GIF_URL = "https://media.giphy.com/media/TmT51OyQLFD7a/giphy.gif";
 
-function sendTipEmail(email, name, topupAmount, code, tipAmount) {
+function sendTipEmail(email, name, topupAmount, code, tipAmount, reference) {
   const subject = "🚨 BREAKING: " + name + " IS OFFICIALLY A TOP-UP VIP 🚨";
 
   const plainBody =
     "Hi " + name + ",\n\n" +
     "🚨 BREAKING NEWS 🚨\n\n" +
     "Your $" + topupAmount + " top-up is CONFIRMED -- and you tipped $" +
-    tipAmount.toFixed(2) + " on top. This is your Recharge Card Number:\n" +
+    tipAmount.toFixed(2) + " on top.\n\n" +
+    "Reference to Recipient: " + reference + "\n\n" +
+    "This is your Recharge Card Number:\n" +
     code + "\n\n" +
     "By order of the Ministry of Generosity, you have been promoted to " +
     "OFFICIAL VIP TOP-UP LEGEND. Your tip goes straight into keeping this " +
@@ -1016,6 +1029,8 @@ function sendTipEmail(email, name, topupAmount, code, tipAmount) {
     name + ' IS OFFICIALLY A TOP-UP VIP</p>' +
     '<p>Your <b>$' + topupAmount + '</b> top-up is <b>CONFIRMED</b> -- and you tipped an extra ' +
     '<b>$' + tipAmount.toFixed(2) + '</b> on top!</p>' +
+    '<p style="font-size:0.9rem;color:#6b7280;">Reference to Recipient</p>' +
+    '<p style="font-size:1.1rem;font-weight:700;letter-spacing:2px;margin-top:0;">' + reference + '</p>' +
     '<p style="font-size:0.9rem;color:#6b7280;">This is your Recharge Card Number</p>' +
     '<p style="font-size:1.3rem;font-weight:700;letter-spacing:2px;">' + code + '</p>' +
     '<p>By order of the Ministry of Generosity, you have been promoted to ' +
