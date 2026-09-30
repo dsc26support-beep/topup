@@ -1,6 +1,22 @@
 /**
- * Kiribati recharge system — backend Web App (v29)
+ * Kiribati recharge system — backend Web App (v30)
  * ---------------------------------------------------
+ * Change from v29: NEW -- a PIN-gated addVoucher action (handleAddVoucher())
+ * for the new restock.html admin tool, which lets you photograph a
+ * physical voucher card and add it straight to the Vouchers sheet
+ * instead of typing rows in by hand. Requires the ADMIN_PIN script
+ * property to be set (fails closed with no PIN configured); 5 wrong
+ * PIN attempts locks the action out for 15 minutes
+ * (isAddVoucherLockedOut()/recordAddVoucherPinFailure(), CacheService,
+ * separate from the customer-submission rate limit since this is a
+ * much smaller, trusted-user surface). Also fixes a real Sheets bug on
+ * this write path: a code starting with "0" was silently losing that
+ * leading zero (Sheets auto-detects numeric-looking text) --
+ * setNumberFormat("@") before setValue() forces the cell to Plain Text
+ * first, so the digits are kept exactly as typed.
+ * SETUP: set the ADMIN_PIN script property to whatever PIN you want
+ * restock.html to require.
+ *
  * Change from v28: doPost()'s "approved" response now also includes
  * voucherCode (the same code just emailed), so the frontend can show
  * it immediately in an on-page popup with a copy/dial button, instead
@@ -418,6 +434,14 @@ function doPost(e) {
     payload = JSON.parse(e.postData.contents);
   } catch (err) {
     return jsonResponse({ status: "error", message: "Bad request body." });
+  }
+
+  // Separate, PIN-gated action for the restock tool (restock.html) -- adds
+  // a new row to the Vouchers sheet from a photographed voucher card. Kept
+  // as an early branch so it never touches the customer-submission flow
+  // below. See handleAddVoucher().
+  if (payload.action === "addVoucher") {
+    return handleAddVoucher(payload);
   }
 
   const reference = normalize(String(payload.reference || ""));
@@ -1104,6 +1128,73 @@ function sendTipEmail(email, name, topupAmount, code, tipAmount, reference) {
     htmlBody: htmlBody,
     name: EMAIL_SENDER_NAME,
   });
+}
+
+// ---- Restock tool (restock.html): PIN-gated addVoucher action ----
+//
+// Lets an admin photograph a physical voucher card and add it straight to
+// the Vouchers sheet, instead of typing rows in by hand. Requires the
+// ADMIN_PIN script property to be set -- with no PIN configured, the
+// action is refused entirely (fails closed, not open).
+//
+// Brute-force protection: 5 wrong PINs locks the action out for 15
+// minutes (CacheService counter, script-wide -- coarse but cheap, no
+// Sheet read needed). This is separate from isPostGloballyRateLimited()
+// (the customer-submission rate limit) since this is a much smaller,
+// trusted-user surface with a different threat model (PIN guessing, not
+// volume abuse).
+function isAddVoucherLockedOut() {
+  const cache = CacheService.getScriptCache();
+  return Number(cache.get("ADDVOUCHER_FAIL_COUNT") || "0") >= 5;
+}
+
+function recordAddVoucherPinFailure() {
+  const cache = CacheService.getScriptCache();
+  const current = Number(cache.get("ADDVOUCHER_FAIL_COUNT") || "0");
+  cache.put("ADDVOUCHER_FAIL_COUNT", String(current + 1), 900);
+}
+
+function resetAddVoucherPinFailures() {
+  CacheService.getScriptCache().remove("ADDVOUCHER_FAIL_COUNT");
+}
+
+function handleAddVoucher(payload) {
+  if (isAddVoucherLockedOut()) {
+    return jsonResponse({ status: "error", message: "Too many incorrect PIN attempts. Try again in 15 minutes." });
+  }
+
+  const expectedPin = PropertiesService.getScriptProperties().getProperty("ADMIN_PIN") || "";
+  if (!expectedPin) {
+    return jsonResponse({ status: "error", message: "Admin PIN not configured on the server (set ADMIN_PIN script property)." });
+  }
+  if (String(payload.pin || "") !== expectedPin) {
+    recordAddVoucherPinFailure();
+    return jsonResponse({ status: "error", message: "Incorrect PIN." });
+  }
+  resetAddVoucherPinFailures();
+
+  const code = String(payload.code || "").trim();
+  const amount = Number(payload.amount);
+  if (!code || !amount) {
+    return jsonResponse({ status: "error", message: "Missing voucher code or amount." });
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(VOUCHERS_SHEET_NAME);
+  if (!sheet) {
+    return jsonResponse({ status: "error", message: "Vouchers sheet not found." });
+  }
+
+  const row = sheet.getLastRow() + 1;
+  // setNumberFormat("@") (Plain Text) BEFORE setValue() is what actually
+  // fixes the leading-zero problem: Sheets auto-detects a numeric-looking
+  // string and silently strips a leading "0" (e.g. "0123" -> 123) unless
+  // the cell's format is explicitly Text first. Column order matches
+  // claimNextVoucher()'s reads: A=code, B=amount, C=used flag.
+  sheet.getRange(row, 1).setNumberFormat("@").setValue(code);
+  sheet.getRange(row, 2).setValue(amount);
+  sheet.getRange(row, 3).setValue("");
+
+  return jsonResponse({ status: "ok", message: "Voucher added.", code: code, amount: amount });
 }
 
 function claimNextVoucher(topupAmount) {
