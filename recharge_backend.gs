@@ -1,6 +1,17 @@
 /**
- * Kiribati recharge system — backend Web App (v30)
+ * Kiribati recharge system — backend Web App (v31)
  * ---------------------------------------------------
+ * Change from v30: fixes a real gap in the v30 restock tool -- its
+ * Unlock button only checked that something was typed, not that it
+ * matched ADMIN_PIN, so the tool panel opened for any input and the
+ * real PIN check only happened later, on actual submit. New "checkPin"
+ * action lets the Unlock button verify the PIN server-side FIRST --
+ * the panel now only opens on a correct PIN. PIN-checking logic
+ * extracted into verifyAdminPin(), shared by checkPin and
+ * handleAddVoucher() (re-verified again on submit too, e.g. in case
+ * the PIN changed or the lockout kicked in between unlock and submit),
+ * so both paths share one lockout counter and one source of truth.
+ *
  * Change from v29: NEW -- a PIN-gated addVoucher action (handleAddVoucher())
  * for the new restock.html admin tool, which lets you photograph a
  * physical voucher card and add it straight to the Vouchers sheet
@@ -436,10 +447,16 @@ function doPost(e) {
     return jsonResponse({ status: "error", message: "Bad request body." });
   }
 
-  // Separate, PIN-gated action for the restock tool (restock.html) -- adds
+  // Separate, PIN-gated actions for the restock tool (restock.html) --
+  // checkPin lets the Unlock button verify the PIN server-side BEFORE
+  // showing the tool (a wrong PIN never opens the panel), addVoucher adds
   // a new row to the Vouchers sheet from a photographed voucher card. Kept
-  // as an early branch so it never touches the customer-submission flow
-  // below. See handleAddVoucher().
+  // as early branches so neither touches the customer-submission flow
+  // below. See verifyAdminPin() / handleAddVoucher().
+  if (payload.action === "checkPin") {
+    const pinCheck = verifyAdminPin(payload.pin);
+    return jsonResponse(pinCheck.ok ? { status: "ok" } : { status: "error", message: pinCheck.message });
+  }
   if (payload.action === "addVoucher") {
     return handleAddVoucher(payload);
   }
@@ -1158,20 +1175,33 @@ function resetAddVoucherPinFailures() {
   CacheService.getScriptCache().remove("ADDVOUCHER_FAIL_COUNT");
 }
 
-function handleAddVoucher(payload) {
+// Shared by the "checkPin" action (restock.html's Unlock button -- verifies
+// the PIN server-side BEFORE showing the tool, so a wrong PIN never opens
+// the panel at all) and handleAddVoucher() (re-verified on actual submit,
+// in case the PIN was changed or the lockout kicked in between unlock and
+// submit). Centralized so both paths share one lockout counter and one
+// source of truth for what counts as a valid PIN.
+function verifyAdminPin(pin) {
   if (isAddVoucherLockedOut()) {
-    return jsonResponse({ status: "error", message: "Too many incorrect PIN attempts. Try again in 15 minutes." });
+    return { ok: false, message: "Too many incorrect PIN attempts. Try again in 15 minutes." };
   }
-
   const expectedPin = PropertiesService.getScriptProperties().getProperty("ADMIN_PIN") || "";
   if (!expectedPin) {
-    return jsonResponse({ status: "error", message: "Admin PIN not configured on the server (set ADMIN_PIN script property)." });
+    return { ok: false, message: "Admin PIN not configured on the server (set ADMIN_PIN script property)." };
   }
-  if (String(payload.pin || "") !== expectedPin) {
+  if (String(pin || "") !== expectedPin) {
     recordAddVoucherPinFailure();
-    return jsonResponse({ status: "error", message: "Incorrect PIN." });
+    return { ok: false, message: "Incorrect PIN." };
   }
   resetAddVoucherPinFailures();
+  return { ok: true };
+}
+
+function handleAddVoucher(payload) {
+  const pinCheck = verifyAdminPin(payload.pin);
+  if (!pinCheck.ok) {
+    return jsonResponse({ status: "error", message: pinCheck.message });
+  }
 
   const code = String(payload.code || "").trim();
   const amount = Number(payload.amount);

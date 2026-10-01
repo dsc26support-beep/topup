@@ -140,11 +140,9 @@
     restockTool.classList.remove("hidden");
   }
 
-  // The PIN is only actually checked server-side on submit -- this just
-  // remembers what was typed for this tab session so it's pre-filled on
-  // the actual addVoucher call, and skips straight to the tool if a PIN
-  // was already entered earlier in this session. A wrong PIN is caught
-  // (and this cleared) the first time Add Voucher is pressed.
+  // A PIN saved here was already verified server-side when it was first
+  // entered (see unlockBtn below), so re-opening the tool from a saved
+  // session PIN skips straight in without hitting the server again.
   (function restorePinFromSession() {
     try {
       const saved = sessionStorage.getItem(PIN_SESSION_KEY);
@@ -155,17 +153,46 @@
     } catch (e) {}
   })();
 
-  unlockBtn.addEventListener("click", () => {
+  // Verifies the PIN with the server BEFORE opening the tool panel -- a
+  // wrong PIN now never unlocks anything, it just shows an error and the
+  // panel stays closed. (Previously this only checked the field wasn't
+  // empty, so any input opened the panel and the real check only
+  // happened later, on actual submit -- fixed in v31.)
+  unlockBtn.addEventListener("click", async () => {
     const pin = pinInput.value.trim();
     if (!pin) {
       pinStatus.textContent = "Enter the PIN first.";
       pinStatus.className = "error";
       return;
     }
-    try { sessionStorage.setItem(PIN_SESSION_KEY, pin); } catch (e) {}
+
+    unlockBtn.disabled = true;
+    unlockBtn.textContent = "Checking...";
     pinStatus.textContent = "";
     pinStatus.className = "";
-    unlockTool();
+
+    try {
+      const response = await fetch(BACKEND_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action: "checkPin", pin: pin }),
+      });
+      const result = await response.json();
+
+      if (result.status === "ok") {
+        try { sessionStorage.setItem(PIN_SESSION_KEY, pin); } catch (e) {}
+        unlockTool();
+      } else {
+        pinStatus.textContent = result.message || "Incorrect PIN.";
+        pinStatus.className = "error";
+      }
+    } catch (err) {
+      pinStatus.textContent = "Network error -- please try again.";
+      pinStatus.className = "error";
+    } finally {
+      unlockBtn.disabled = false;
+      unlockBtn.textContent = "Unlock";
+    }
   });
 
   const takePhotoBtn = document.getElementById("take-photo-btn");
