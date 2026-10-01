@@ -30,11 +30,14 @@ jobs:
 
       - name: Stage the backend file for clasp
         # recharge_backend.gs stays the single source of truth at the repo
-        # root (same file the manual copy-paste workflow has always used);
-        # this just copies it into the folder .clasp.json points clasp at,
-        # alongside the real appsscript.json manifest already committed
-        # there (fetched once via `clasp pull`, never hand-written).
-        run: cp recharge_backend.gs appsscript/recharge_backend.gs
+        # root (same file the manual copy-paste workflow has always used).
+        # The real Apps Script project's script file is named "Code" (its
+        # default name, confirmed via `clasp pull`) -- this OVERWRITES
+        # appsscript/Code.js with the root file's content, rather than
+        # creating a same-named-as-root copy, which would have left
+        # Code.js (the file actually running live) untouched and created
+        # a stray unused file instead.
+        run: cp recharge_backend.gs appsscript/Code.js
 
       - name: Push to Apps Script
         run: clasp push -f
