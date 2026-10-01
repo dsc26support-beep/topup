@@ -1,0 +1,46 @@
+name: Deploy Apps Script backend
+
+# Runs on GitHub's own servers (not Claude's sandbox, not your computer),
+# which is exactly why it can reach script.google.com when neither of
+# those can. Triggers only when recharge_backend.gs actually changes on
+# this branch -- editing index.html or restock.html won't fire a deploy.
+on:
+  push:
+    branches:
+      - claude/practical-maxwell-0a9vrz
+    paths:
+      - recharge_backend.gs
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Install clasp (Google's Apps Script CLI)
+        run: npm install -g @google/clasp
+
+      - name: Restore clasp login credentials
+        # CLASPRC_JSON is a GitHub Secret holding the contents of the
+        # ~/.clasprc.json file that `clasp login` creates on your own
+        # computer (one-time, manual -- see appsscript/README.md).
+        # Secrets are encrypted and never appear in logs.
+        run: echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
+
+      - name: Stage the backend file for clasp
+        # recharge_backend.gs stays the single source of truth at the repo
+        # root (same file the manual copy-paste workflow has always used);
+        # this just copies it into the folder .clasp.json points clasp at,
+        # alongside the real appsscript.json manifest already committed
+        # there (fetched once via `clasp pull`, never hand-written).
+        run: cp recharge_backend.gs appsscript/recharge_backend.gs
+
+      - name: Push to Apps Script
+        run: clasp push -f
+
+      - name: Deploy as a new version of the existing Web App
+        # -i targets your EXISTING deployment ID, so the live /exec URL
+        # never changes -- this updates it in place, the same effect as
+        # Deploy > Manage deployments > pencil > New version > Deploy.
+        run: clasp deploy -i AKfycbzsVG28G1xvNkA5gqLVTDw6qtM7SSnacp4lGklef1AEneNwulpTPNPNciLke-pRA3LR -d "Auto-deployed from GitHub Actions ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
