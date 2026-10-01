@@ -33,7 +33,7 @@
   h1 { font-size: 1.3rem; margin: 0 0 4px; }
   .subtitle { color: var(--muted); font-size: 0.85rem; margin: 0 0 20px; }
   label { display: block; font-weight: 600; font-size: 0.9rem; margin: 16px 0 6px; }
-  input[type="text"], input[type="number"], input[type="password"] {
+  input[type="text"], input[type="number"], input[type="password"], select {
     width: 100%; padding: 10px 12px; border: 1px solid var(--border);
     border-radius: 8px; font-size: 1rem; background: #fff; color: var(--text);
   }
@@ -106,7 +106,14 @@
     <input type="text" id="code-input" autocomplete="off">
 
     <label for="amount-input">Amount ($)</label>
-    <input type="number" id="amount-input" step="0.01" min="0">
+    <select id="amount-input">
+      <option value="">Select amount</option>
+      <option value="2">$2</option>
+      <option value="3">$3</option>
+      <option value="6">$6</option>
+      <option value="10">$10</option>
+      <option value="20">$20</option>
+    </select>
 
     <details class="raw-ocr" id="raw-ocr-details">
       <summary>Raw OCR text (if the fields above look wrong)</summary>
@@ -243,8 +250,18 @@
       const text = (result && result.data && result.data.text) || "";
       rawOcrText.textContent = text.trim() || "(no text found)";
 
+      // Snap to the nearest valid denomination -- the dropdown only offers
+      // 2/3/6/10/20, so an OCR read like "$10.00" needs rounding down to
+      // "10" to actually match an <option> value.
+      const VALID_AMOUNTS = [2, 3, 6, 10, 20];
       const amountMatch = text.match(/\$\s?(\d{1,4}(?:\.\d{2})?)/);
-      if (amountMatch) amountInput.value = amountMatch[1];
+      if (amountMatch) {
+        const read = Number(amountMatch[1]);
+        const closest = VALID_AMOUNTS.reduce((a, b) =>
+          Math.abs(b - read) < Math.abs(a - read) ? b : a
+        );
+        amountInput.value = String(closest);
+      }
 
       const codeMatches = text.match(/[A-Z0-9]{6,}/gi) || [];
       if (codeMatches.length) {
