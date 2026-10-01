@@ -1,6 +1,19 @@
 /**
- * Kiribati recharge system — backend Web App (v32)
+ * Kiribati recharge system — backend Web App (v33)
  * ---------------------------------------------------
+ * Change from v32: NEW -- logRestockAttempt() writes a persistent audit
+ * row (Timestamp | Code | Amount | Outcome) to a new "Restock Log" sheet
+ * tab on every handleAddVoucher() outcome (Added, Duplicate code
+ * skipped, Missing code or amount, PIN failure, Vouchers sheet not
+ * found) -- restock.html's success/error toast disappears the moment
+ * you navigate away, this doesn't. Same leading-zero protection as the
+ * other voucher-code writes. Silently no-ops if the "Restock Log" tab
+ * hasn't been created yet (same convention as Reference/Archive/Used
+ * Vouchers), so it's safe to redeploy before adding the tab.
+ * SETUP: add a "Restock Log" sheet tab (header row optional: Timestamp |
+ * Code | Amount | Outcome) if you want this log to actually record
+ * anything -- until it exists, logging is just a no-op.
+ *
  * Change from v31: two restock-tool fixes.
  * (1) The leading-zero fix (v30) only protected handleAddVoucher()'s own
  * write -- archiveUsedVoucher()'s appendRow() into "Used Vouchers" (when
@@ -1245,23 +1258,48 @@ function isVoucherCodeAlreadyPresent(code) {
   return false;
 }
 
+// Persistent audit trail for the restock tool -- a toast message in
+// restock.html disappears the moment you navigate away, so this records
+// what the background logic actually decided (added / duplicate-skipped /
+// PIN failure / etc.) somewhere you can review later. Silently no-ops if
+// the "Restock Log" tab hasn't been created yet, same convention as
+// Reference/Archive/Used Vouchers. Column order: Timestamp | Code |
+// Amount | Outcome. Code gets the same leading-zero protection as the
+// other voucher-code writes (see handleAddVoucher/archiveUsedVoucher) --
+// appendRow() alone would risk the same silent digit loss here too.
+const RESTOCK_LOG_SHEET_NAME = "Restock Log";
+
+function logRestockAttempt(outcome, code, amount) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RESTOCK_LOG_SHEET_NAME);
+  if (!sheet) return;
+  sheet.appendRow([new Date(), code || "", amount || "", outcome]);
+  if (code) {
+    const newRow = sheet.getLastRow();
+    sheet.getRange(newRow, 2).setNumberFormat("@").setValue(code);
+  }
+}
+
 function handleAddVoucher(payload) {
   const pinCheck = verifyAdminPin(payload.pin);
   if (!pinCheck.ok) {
+    logRestockAttempt("PIN failure: " + pinCheck.message, payload.code, payload.amount);
     return jsonResponse({ status: "error", message: pinCheck.message });
   }
 
   const code = String(payload.code || "").trim();
   const amount = Number(payload.amount);
   if (!code || !amount) {
+    logRestockAttempt("Missing code or amount", code, amount);
     return jsonResponse({ status: "error", message: "Missing voucher code or amount." });
   }
   if (isVoucherCodeAlreadyPresent(code)) {
+    logRestockAttempt("Duplicate code, skipped", code, amount);
     return jsonResponse({ status: "error", message: "This voucher code already exists (unused or already used) -- skipped to avoid a duplicate." });
   }
 
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(VOUCHERS_SHEET_NAME);
   if (!sheet) {
+    logRestockAttempt("Vouchers sheet not found", code, amount);
     return jsonResponse({ status: "error", message: "Vouchers sheet not found." });
   }
 
@@ -1275,6 +1313,7 @@ function handleAddVoucher(payload) {
   sheet.getRange(row, 2).setValue(amount);
   sheet.getRange(row, 3).setValue("");
 
+  logRestockAttempt("Added", code, amount);
   return jsonResponse({ status: "ok", message: "Voucher added.", code: code, amount: amount });
 }
 
