@@ -1,6 +1,22 @@
 /**
- * Kiribati recharge system — backend Web App (v31)
+ * Kiribati recharge system — backend Web App (v32)
  * ---------------------------------------------------
+ * Change from v31: two restock-tool fixes.
+ * (1) The leading-zero fix (v30) only protected handleAddVoucher()'s own
+ * write -- archiveUsedVoucher()'s appendRow() into "Used Vouchers" (when
+ * a voucher is claimed) writes into that column's EXISTING number
+ * format, which if still "Automatic" re-strips a leading "0" there too.
+ * The customer's emailed code was never affected (read from the
+ * correctly-formatted cell before this copy runs) but the Used Vouchers
+ * record itself could end up wrong. Now forces that cell to Text and
+ * re-sets the value right after appendRow(), same fix as the original.
+ * (2) NEW -- isVoucherCodeAlreadyPresent() checks both Vouchers and Used
+ * Vouchers for an exact match before handleAddVoucher() writes, so
+ * accidentally photographing the same card twice during a batch upload
+ * gets refused instead of silently creating an unreachable duplicate row
+ * (claimNextVoucher() always returns the first match for a given amount,
+ * so later duplicates are just dead inventory).
+ *
  * Change from v30: fixes a real gap in the v30 restock tool -- its
  * Unlock button only checked that something was typed, not that it
  * matched ADMIN_PIN, so the tool panel opened for any input and the
@@ -1027,6 +1043,17 @@ function archiveUsedVoucher(rowIndex) {
   if (!usedSheet) return;
   const rowValues = vSheet.getRange(rowIndex, 1, 1, vSheet.getLastColumn()).getValues()[0];
   usedSheet.appendRow(rowValues);
+  // appendRow() writes into column A's existing number format -- if that's
+  // still "Automatic" (the default), Sheets re-applies its usual numeric
+  // auto-detection on write and can strip a leading "0" off the voucher
+  // code, even though rowValues[0] was already the correct string (the
+  // customer's email is unaffected -- that's sent from the original,
+  // correctly-formatted cell before this copy ever runs -- but this
+  // sheet's own record would end up wrong). Force the new cell to Text
+  // and re-set the value right after, same fix as handleAddVoucher()'s
+  // original write.
+  const newRow = usedSheet.getLastRow();
+  usedSheet.getRange(newRow, 1).setNumberFormat("@").setValue(rowValues[0]);
   vSheet.deleteRow(rowIndex);
 }
 
@@ -1197,6 +1224,27 @@ function verifyAdminPin(pin) {
   return { ok: true };
 }
 
+// Scans both the active Vouchers sheet and Used Vouchers (so re-adding an
+// already-claimed code is caught too, not just an unused duplicate) for an
+// exact (case-insensitive) match. Called before every restock write --
+// photographing the same card twice is an easy accident during a batch
+// upload, and an unnoticed duplicate becomes dead inventory that looks
+// available but is never reachable (claimNextVoucher() always returns the
+// FIRST match for a given amount).
+function isVoucherCodeAlreadyPresent(code) {
+  const normalized = code.trim().toUpperCase();
+  const sheetNames = [VOUCHERS_SHEET_NAME, USED_VOUCHERS_SHEET_NAME];
+  for (let s = 0; s < sheetNames.length; s++) {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetNames[s]);
+    if (!sheet) continue;
+    const data = sheet.getDataRange().getValues();
+    for (let i = 0; i < data.length; i++) {
+      if (String(data[i][0] || "").trim().toUpperCase() === normalized) return true;
+    }
+  }
+  return false;
+}
+
 function handleAddVoucher(payload) {
   const pinCheck = verifyAdminPin(payload.pin);
   if (!pinCheck.ok) {
@@ -1207,6 +1255,9 @@ function handleAddVoucher(payload) {
   const amount = Number(payload.amount);
   if (!code || !amount) {
     return jsonResponse({ status: "error", message: "Missing voucher code or amount." });
+  }
+  if (isVoucherCodeAlreadyPresent(code)) {
+    return jsonResponse({ status: "error", message: "This voucher code already exists (unused or already used) -- skipped to avoid a duplicate." });
   }
 
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(VOUCHERS_SHEET_NAME);
