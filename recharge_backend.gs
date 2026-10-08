@@ -1,6 +1,13 @@
 /**
- * Kiribati recharge system — backend Web App (v34)
+ * Kiribati recharge system — backend Web App (v35)
  * ---------------------------------------------------
+ * Change from v34: extractReceiptNumberFromText() now guards against a
+ * non-string ocrText (e.g. calling checkReceiptNumber() with no argument
+ * from the Apps Script editor's function dropdown, which passes
+ * undefined) by returning null instead of throwing on ocrText.match().
+ * Never happens via doPost() -- ocrImage() always returns a string --
+ * but crashed any manual test run that way.
+ *
  * Change from v33: four new hardening criteria on the customer
  * screenshot-approval rule -- any one of the first three failing makes
  * looksValid false (Rejected, same treatment as the existing checks);
@@ -1064,6 +1071,7 @@ function checkAmountPaid(ocrText, costAmount) {
 // "missing tab = not enforced" convention as Reference/Archive), but the
 // "must be present" half of this check always applies regardless.
 function extractReceiptNumberFromText(ocrText) {
+  if (typeof ocrText !== "string") return null;
   const match = ocrText.match(/\b[A-Za-z]{2,4}\d{4,8}\b/);
   return match ? match[0] : null;
 }
