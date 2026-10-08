@@ -1,6 +1,45 @@
 /**
- * Kiribati recharge system — backend Web App (v33)
+ * Kiribati recharge system — backend Web App (v34)
  * ---------------------------------------------------
+ * Change from v33: four new hardening criteria on the customer
+ * screenshot-approval rule -- any one of the first three failing makes
+ * looksValid false (Rejected, same treatment as the existing checks);
+ * the fourth only holds back auto-approval (Pending Review), since it's
+ * a velocity throttle on an otherwise-genuine payment, not a validity
+ * check.
+ * (1) checkPaymentAfterReference() -- the receipt's date (and time,
+ * when parseable) must be after the moment its reference was issued
+ * (getReferenceIssuedAt(), reading the Reference sheet's "Issued At"
+ * column). A date-only match (no time-of-day found) is compared at
+ * calendar-day granularity instead of exact timestamp, since a bare
+ * date defaults to midnight and would otherwise wrongly fail a
+ * legitimate same-day-but-later payment.
+ * (2) checkReceiptNumber() -- REPLACES the old "must be roughly
+ * increasing" bank-reference-sequence heuristic (v16-v18,
+ * checkBankReferenceNumber()/advanceLastBankRefSeq(), now removed) with
+ * a stricter, simpler rule: the receipt/transaction number must
+ * actually be found on the screenshot (previously optional/"not
+ * enforced" if missing -- now required), and that exact number can
+ * never be reused across any submission, in any order, logged to a new
+ * "Used Receipt Numbers" sheet tab.
+ * (3) checkImageNotEdited() -- rejects a screenshot carrying an
+ * editor-software signature (PicsArt, Snapseed, Canva, Photoshop --
+ * all embed their name in EXIF/XMP metadata near the start of the
+ * file) or whose actual pixel dimensions (parsed straight from the
+ * PNG/JPEG header) don't look like a real phone screenshot
+ * (landscape, square, or outside a generous portrait-ratio band).
+ * (4) checkWithinWeeklyAutoApproveCap() -- caps total top-up value
+ * auto-approved per customer email to a rolling 7-day window:
+ * WEEKLY_AUTO_APPROVE_CAP (default $20) once a customer has
+ * NEW_CUSTOMER_GRADUATION_COUNT (default 2) lifetime approvals,
+ * NEW_CUSTOMER_WEEKLY_CAP (default $10) before that. All three are
+ * script properties, same tuning convention as AUTO_APPROVE_MAX etc.
+ * SETUP: add a "Used Receipt Numbers" sheet tab (2 columns: Receipt
+ * Number | Used At) -- until it exists, duplicate-checking isn't
+ * enforced (the "must be present" half of check (2) still is). The
+ * LAST_BANK_REF_SEQ and BANK_REF_SEQ_TOLERANCE script properties are
+ * no longer read and can be deleted.
+ *
  * Change from v32: NEW -- logRestockAttempt() writes a persistent audit
  * row (Timestamp | Code | Amount | Outcome) to a new "Restock Log" sheet
  * tab on every handleAddVoucher() outcome (Added, Duplicate code
@@ -327,6 +366,9 @@
  *   New in v25 (both optional, sensible defaults if unset):
  *   POST_RATE_LIMIT_PER_MINUTE (default 5), POST_RATE_LIMIT_PER_HOUR
  *   (default 20)
+ *   New in v34 (all optional, sensible defaults if unset):
+ *   WEEKLY_AUTO_APPROVE_CAP (default 20), NEW_CUSTOMER_WEEKLY_CAP
+ *   (default 10), NEW_CUSTOMER_GRADUATION_COUNT (default 2)
  *   Recommended BANK_KEYWORDS value based on your screenshot: "ANZ"
  *
  * IMPORTANT — Responses sheet columns changed (Phone column removed):
@@ -351,6 +393,7 @@ const VOUCHERS_SHEET_NAME = "Vouchers";
 const ARCHIVE_SHEET_NAME = "Archive";
 const USED_VOUCHERS_SHEET_NAME = "Used Vouchers";
 const REFERENCE_SHEET_NAME = "Reference";
+const USED_RECEIPT_NUMBERS_SHEET_NAME = "Used Receipt Numbers";
 const ACCOUNT_NUMBER = "786149";
 
 const COL = {
@@ -437,6 +480,27 @@ function isReferenceIssuedByUs(reference) {
     if (normalize(String(data[i][0] || "")) === reference) return true;
   }
   return false;
+}
+
+// Separate from isReferenceIssuedByUs() above (which only needs a
+// yes/no) -- this re-scans the same sheet for the actual "Issued At"
+// timestamp of a reference, used by checkPaymentAfterReference() (v34)
+// to confirm a submitted receipt's date/time isn't from before the
+// order even existed. Returns null if the sheet is missing or the
+// reference isn't found, in which case that check isn't enforced --
+// the separate !refIssued fraud path already covers an unrecognized
+// reference.
+function getReferenceIssuedAt(reference) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(REFERENCE_SHEET_NAME);
+  if (!sheet) return null;
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (normalize(String(data[i][0] || "")) === reference) {
+      const issuedAt = new Date(data[i][1]);
+      return isNaN(issuedAt.getTime()) ? null : issuedAt;
+    }
+  }
+  return null;
 }
 
 // A reference only ever needs to stay valid for the payment window (the
@@ -536,6 +600,7 @@ function doPost(e) {
       return jsonResponse({ status: "error", message: "That image looks too small or empty. Please re-upload the screenshot." });
     }
     const isLikelyPhoto = hasExifMarker(imageBytes);
+    const imageCheck = checkImageNotEdited(imageBytes, mimeType);
 
     const screenshotHash = computeImageHash(imageBytes);
     if (isScreenshotAlreadyUsed(screenshotHash)) {
@@ -555,26 +620,32 @@ function doPost(e) {
     const amountMatched = amountCheck.matched;
     const tipAmount = amountCheck.tipAmount;
 
-    const bankRefCheck = checkBankReferenceNumber(ocrText);
+    const receiptCheck = checkReceiptNumber(ocrText);
     const refIssued = isReferenceIssuedByUs(reference);
+    const referenceIssuedAt = getReferenceIssuedAt(reference);
+    const paymentAfterReferenceCheck = checkPaymentAfterReference(ocrText, referenceIssuedAt);
     const isUnsubmittedScreen = looksLikeUnsubmittedTransferScreen(ocrText);
 
     const looksValid = refMatched && amountMatched && acctMatched &&
-      successMatched && bankMatched && recency.ok && bankRefCheck.ok &&
-      !isUnsubmittedScreen;
+      successMatched && bankMatched && recency.ok && receiptCheck.ok &&
+      !isUnsubmittedScreen && paymentAfterReferenceCheck.ok && imageCheck.ok;
 
     const props = PropertiesService.getScriptProperties();
     const autoMax = Number(props.getProperty("AUTO_APPROVE_MAX") || "0");
-    const eligibleForAuto = looksValid && refIssued && costAmount <= autoMax;
+    const weeklyCapCheck = checkWithinWeeklyAutoApproveCap(email, topupAmount);
+    const eligibleForAuto = looksValid && refIssued && costAmount <= autoMax && weeklyCapCheck.ok;
 
     // looksValid true but not eligibleForAuto means it's only being held
-    // back by AUTO_APPROVE_MAX -- a legitimate "needs a human to say OK"
-    // case, so Pending Review. A small underpayment (within
-    // UNDERPAY_TOLERANCE) no longer blocks auto-approval on its own --
-    // it still goes through like a matching payment. looksValid false
-    // means a real check failed (wrong reference, wrong account, no
-    // success/bank wording, too old, or a genuine amount mismatch) --
-    // those are Rejected outright, not left in limbo.
+    // back by AUTO_APPROVE_MAX or the weekly per-customer cap (v34) -- a
+    // legitimate "needs a human to say OK" case, so Pending Review. A
+    // small underpayment (within UNDERPAY_TOLERANCE) no longer blocks
+    // auto-approval on its own -- it still goes through like a matching
+    // payment. looksValid false means a real check failed (wrong
+    // reference, wrong account, no success/bank wording, too old, a
+    // genuine amount mismatch, a missing/reused receipt number, a
+    // receipt dated before the reference was issued, or a detected
+    // editor signature/wrong screenshot shape -- the four v34 additions)
+    // -- those are Rejected outright, not left in limbo.
     // !refIssued overrides all of that -- the submitted reference doesn't
     // match any code this server ever generated (via doGet/issueReference),
     // which is a strong tampering/fraud signal. It always forces Pending
@@ -592,9 +663,13 @@ function doPost(e) {
       "Exif:" + isLikelyPhoto,
       "Paid:" + (amountCheck.paidAmount !== null ? amountCheck.paidAmount.toFixed(2) : "n/a"),
       "Tip:" + tipAmount.toFixed(2),
-      "BankRefSeq:" + (bankRefCheck.found
-        ? bankRefCheck.seq + (bankRefCheck.ok ? " (OK, last was " + bankRefCheck.lastSeen + ")" : " (<= last seen " + bankRefCheck.lastSeen + ")")
-        : "not found"),
+      "ReceiptNumber:" + receiptCheck.ok + " (" + (receiptCheck.found
+        ? (receiptCheck.duplicate ? "duplicate, already used: " + receiptCheck.receiptNumber : "OK: " + receiptCheck.receiptNumber)
+        : "not found on screenshot") + ")",
+      "PaymentAfterReference:" + paymentAfterReferenceCheck.ok + " (" + paymentAfterReferenceCheck.note + ")",
+      "ImageOk:" + imageCheck.ok + " (editor signature found:" + imageCheck.editorSignature + ", shape ok:" + imageCheck.validShape + ")",
+      "WeeklyCap:" + weeklyCapCheck.ok + " (customer total this week: $" + weeklyCapCheck.weeklyApprovedTotal.toFixed(2) +
+        " / cap $" + weeklyCapCheck.cap + ", lifetime approvals:" + weeklyCapCheck.lifetimeApprovedCount + ")",
       "RefIssued:" + refIssued + (refIssued ? "" : " (SUSPECTED FRAUD -- reference not recognized as server-issued)"),
     ].join(" | ");
 
@@ -610,8 +685,8 @@ function doPost(e) {
       alertSuspectedFraud(reference, name, email, topupAmount, costAmount, screenshotUrl);
     }
 
-    if (eligibleForAuto && bankRefCheck.found) {
-      advanceLastBankRefSeq(bankRefCheck.seq);
+    if (eligibleForAuto && receiptCheck.found) {
+      recordReceiptNumberUsed(receiptCheck.receiptNumber);
     }
 
     if (eligibleForAuto) {
@@ -720,6 +795,63 @@ function isRateLimited(email) {
   return count >= limit;
 }
 
+// ---- Per-customer weekly auto-approve cap (v34) ----
+//
+// Caps how much top-up VALUE a single customer (by email) can have
+// auto-approved in a rolling 7-day window, no matter how many separate
+// submissions that takes -- this bounds what a compromised identity or a
+// pipeline that's fooling the other checks could extract before a human
+// has to sign off, the same role a bank's new-account transaction limit
+// plays. New customers (fewer than NEW_CUSTOMER_GRADUATION_COUNT prior
+// approvals, lifetime) get a lower starting cap until they've paid a few
+// times. This is a velocity throttle, not a validity check -- unlike
+// the other three v34 criteria, failing it does NOT make looksValid
+// false or Reject the row; like the existing AUTO_APPROVE_MAX ceiling,
+// it only holds back auto-approval, routing to Pending Review instead,
+// since the payment itself may be entirely genuine. Reads the Archive
+// sheet (where auto-approved rows end up once emailed) for history; all
+// four thresholds are script properties so they can be tuned without a
+// redeploy.
+function getCustomerApprovalHistory(email) {
+  const emailLower = email.toLowerCase();
+  const oneWeekAgo = new Date(Date.now() - 7 * 24 * 3600000);
+  let lifetimeApprovedCount = 0;
+  let weeklyApprovedTotal = 0;
+
+  const archiveSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ARCHIVE_SHEET_NAME);
+  if (archiveSheet) {
+    const data = archiveSheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      const rowEmail = String(data[i][COL.EMAIL - 1] || "").toLowerCase();
+      const status = String(data[i][COL.STATUS - 1] || "").toLowerCase();
+      if (rowEmail !== emailLower || status !== "approved") continue;
+      lifetimeApprovedCount++;
+      const ts = new Date(data[i][COL.TIMESTAMP - 1]);
+      if (ts >= oneWeekAgo) {
+        weeklyApprovedTotal += Number(data[i][COL.TOPUP_AMOUNT - 1]) || 0;
+      }
+    }
+  }
+  return { lifetimeApprovedCount: lifetimeApprovedCount, weeklyApprovedTotal: weeklyApprovedTotal };
+}
+
+function checkWithinWeeklyAutoApproveCap(email, topupAmount) {
+  const props = PropertiesService.getScriptProperties();
+  const fullCap = Number(props.getProperty("WEEKLY_AUTO_APPROVE_CAP") || "20");
+  const newCustomerCap = Number(props.getProperty("NEW_CUSTOMER_WEEKLY_CAP") || "10");
+  const graduationCount = Number(props.getProperty("NEW_CUSTOMER_GRADUATION_COUNT") || "2");
+
+  const history = getCustomerApprovalHistory(email);
+  const cap = history.lifetimeApprovedCount >= graduationCount ? fullCap : newCustomerCap;
+  const projectedTotal = history.weeklyApprovedTotal + topupAmount;
+  return {
+    ok: projectedTotal <= cap,
+    cap: cap,
+    weeklyApprovedTotal: history.weeklyApprovedTotal,
+    lifetimeApprovedCount: history.lifetimeApprovedCount,
+  };
+}
+
 // ---- Reference dedup ----
 
 // Rows that were Approved + emailed get moved out of Responses and into
@@ -775,6 +907,80 @@ function hasExifMarker(bytes) {
     }
   }
   return false;
+}
+
+// ---- Reject edited images (v34) ----
+//
+// Two independent signals, either one fails the check:
+//  1. Editor software signature -- PicsArt, Snapseed, Canva and
+//     Photoshop all embed their name as plain ASCII in the file's
+//     EXIF "Software" tag or XMP metadata, which (like real EXIF data)
+//     sits near the start of the file, well before the pixel data --
+//     scanning the first 64KB is enough without decoding the whole
+//     image, same economy as hasExifMarker() above.
+//  2. Wrong shape -- a genuine phone screenshot is a tall portrait
+//     rectangle; this parses the actual pixel width/height straight out
+//     of the PNG/JPEG header (no image library needed) and rejects
+//     anything landscape, square, or outside a generous band for real
+//     phone aspect ratios. If the dimensions can't be determined at all
+//     (an unsupported format, or a malformed header), this half isn't
+//     enforced -- more likely an unusual encoding than a real problem.
+const EDITOR_SIGNATURES = ["picsart", "snapseed", "canva", "photoshop"];
+
+function containsEditorSignature(bytes) {
+  const scanLength = Math.min(bytes.length, 65536);
+  const chunk = bytes.slice(0, scanLength);
+  const text = Utilities.newBlob(chunk).getDataAsString("ISO-8859-1").toLowerCase();
+  for (let i = 0; i < EDITOR_SIGNATURES.length; i++) {
+    if (text.indexOf(EDITOR_SIGNATURES[i]) !== -1) return true;
+  }
+  return false;
+}
+
+function getImageDimensions(bytes, mimeType) {
+  if (mimeType === "image/png" && bytes.length >= 24) {
+    // 8-byte PNG signature + 4-byte chunk length + 4-byte "IHDR" tag,
+    // then 4-byte width + 4-byte height, big-endian.
+    const width = (u(bytes[16]) << 24) | (u(bytes[17]) << 16) | (u(bytes[18]) << 8) | u(bytes[19]);
+    const height = (u(bytes[20]) << 24) | (u(bytes[21]) << 16) | (u(bytes[22]) << 8) | u(bytes[23]);
+    if (width > 0 && height > 0) return { width: width, height: height };
+    return null;
+  }
+  if (mimeType === "image/jpeg" || mimeType === "image/jpg") {
+    // Walk marker segments past the initial 0xFFD8 SOI marker until an
+    // SOFn (Start Of Frame) marker, which carries the pixel dimensions --
+    // everything before it (APPn/EXIF/COM segments) is skipped by its
+    // own declared length.
+    let i = 2;
+    while (i + 9 < bytes.length) {
+      if (u(bytes[i]) !== 0xff) { i++; continue; }
+      const marker = u(bytes[i + 1]);
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+      if (marker === 0xd9) break; // EOI
+      const segLength = (u(bytes[i + 2]) << 8) | u(bytes[i + 3]);
+      const isSOF = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+      if (isSOF) {
+        const height = (u(bytes[i + 5]) << 8) | u(bytes[i + 6]);
+        const width = (u(bytes[i + 7]) << 8) | u(bytes[i + 8]);
+        return width > 0 && height > 0 ? { width: width, height: height } : null;
+      }
+      i += 2 + segLength;
+    }
+  }
+  return null;
+}
+
+function looksLikePhoneScreenshotShape(dims) {
+  if (!dims) return true; // can't determine (e.g. WebP) -- don't enforce
+  const ratio = dims.height / dims.width;
+  return ratio >= 1.6 && ratio <= 2.5;
+}
+
+function checkImageNotEdited(bytes, mimeType) {
+  const editorSignature = containsEditorSignature(bytes);
+  const dims = getImageDimensions(bytes, mimeType);
+  const validShape = looksLikePhoneScreenshotShape(dims);
+  return { ok: !editorSignature && validShape, editorSignature: editorSignature, dims: dims, validShape: validShape };
 }
 
 // ---- Duplicate screenshot hash ----
@@ -837,48 +1043,55 @@ function checkAmountPaid(ocrText, costAmount) {
   return { matched: false, paidAmount: paidAmount, tipAmount: 0, underTolerance: false };
 }
 
-// ---- Bank reference number sequence check ----
+// ---- Bank receipt/transaction number: required, one-time-use (v34) ----
 //
-// ANZ's own auto-generated Reference Number on the receipt (e.g.
-// "AQC78922") -- NOT the buyer-typed Recipient Reference. It's a letter
-// prefix followed by a run of digits. Assumption (flagged as unverified):
-// the digit run only ever increases over time, so a new submission whose
-// number is well below the last one we accepted is treated as suspicious
-// (most likely a reused/old screenshot). A BANK_REF_SEQ_TOLERANCE buffer
-// (default 400) allows a number to land slightly below the highest one
-// seen -- covers other customers' payments arriving out of order in the
-// bank's own numbering -- without opening the door to an old screenshot
-// being replayed. The letter prefix itself is ignored for the comparison
-// -- only the numeric part is tracked, via the LAST_BANK_REF_SEQ script
-// property, updated only when a submission is actually auto-approved
-// (never from a rejected/pending row, so a bad submission can't poison
-// the baseline). If no such number can be found in the OCR text at all,
-// the check is not enforced (ok:true, found:false) rather than treated
-// as a failure, since that's more likely an OCR miss than a real problem.
-function extractBankRefNumberFromText(ocrText) {
-  const match = ocrText.match(/\b[A-Za-z]{2,4}(\d{4,8})\b/);
-  if (!match) return null;
-  const seq = parseInt(match[1], 10);
-  return isNaN(seq) ? null : seq;
+// REPLACES the old "sequence must be increasing, within a tolerance
+// buffer" heuristic (v16-v18) with a simpler, stricter rule: ANZ's own
+// auto-generated Reference Number on the receipt (e.g. "AQC78922" -- NOT
+// the buyer-typed Recipient Reference) must actually be present on the
+// screenshot (previously, not finding it just meant "not enforced" --
+// now it's a hard requirement), and that exact number can never be
+// reused across any submission, ever, in any order. This replaces
+// "roughly increasing" with "exact one-time use," which is both
+// stricter and simpler to reason about -- it no longer matters whether
+// another customer's payment briefly makes the sequence look like it
+// went backwards, and it directly prevents the same receipt being
+// replayed regardless of when the first use happened. Used numbers are
+// logged to the "Used Receipt Numbers" sheet (col A: number, col B: used
+// at) only when a submission is actually auto-approved (never from a
+// rejected/pending row, so a bad submission can't poison the ledger). If
+// that sheet doesn't exist yet, duplicate-checking isn't enforced (same
+// "missing tab = not enforced" convention as Reference/Archive), but the
+// "must be present" half of this check always applies regardless.
+function extractReceiptNumberFromText(ocrText) {
+  const match = ocrText.match(/\b[A-Za-z]{2,4}\d{4,8}\b/);
+  return match ? match[0] : null;
 }
 
-function checkBankReferenceNumber(ocrText) {
-  const seq = extractBankRefNumberFromText(ocrText);
-  if (seq === null) {
-    return { ok: true, found: false, seq: null, lastSeen: null };
+function isReceiptNumberAlreadyUsed(receiptNumber) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(USED_RECEIPT_NUMBERS_SHEET_NAME);
+  if (!sheet) return false; // tab not set up yet -- can't track duplicates, don't false-flag everyone
+  const data = sheet.getDataRange().getValues();
+  const normalized = normalize(receiptNumber);
+  for (let i = 1; i < data.length; i++) {
+    if (normalize(String(data[i][0] || "")) === normalized) return true;
   }
-  const props = PropertiesService.getScriptProperties();
-  const lastSeen = Number(props.getProperty("LAST_BANK_REF_SEQ") || "0");
-  const tolerance = Number(props.getProperty("BANK_REF_SEQ_TOLERANCE") || "400");
-  return { ok: seq > lastSeen - tolerance, found: true, seq: seq, lastSeen: lastSeen };
+  return false;
 }
 
-function advanceLastBankRefSeq(seq) {
-  const props = PropertiesService.getScriptProperties();
-  const lastSeen = Number(props.getProperty("LAST_BANK_REF_SEQ") || "0");
-  if (seq > lastSeen) {
-    props.setProperty("LAST_BANK_REF_SEQ", String(seq));
+function recordReceiptNumberUsed(receiptNumber) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(USED_RECEIPT_NUMBERS_SHEET_NAME);
+  if (!sheet) return;
+  sheet.appendRow([receiptNumber, new Date()]);
+}
+
+function checkReceiptNumber(ocrText) {
+  const receiptNumber = extractReceiptNumberFromText(ocrText);
+  if (!receiptNumber) {
+    return { ok: false, found: false, receiptNumber: null, duplicate: false };
   }
+  const duplicate = isReceiptNumberAlreadyUsed(receiptNumber);
+  return { ok: !duplicate, found: true, receiptNumber: receiptNumber, duplicate: duplicate };
 }
 
 function ocrContainsSuccessWord(ocrText) {
@@ -936,6 +1149,65 @@ function extractDateFromText(text) {
     if (!isNaN(d.getTime())) return d;
   }
   return null;
+}
+
+// ---- Payment-must-follow-reference-issue check (v34) ----
+//
+// Builds on extractDateFromText() above by also looking for a time-of-day
+// next to the date, so a receipt can be compared against the EXACT moment
+// its reference was issued (getReferenceIssuedAt()), not just the day.
+// precise:true means both a date and a parseable time were found;
+// precise:false means only a bare date was found (time defaults to
+// midnight), which checkPaymentAfterReference() below treats specially --
+// see its comment for why.
+function extractDateTimeFromText(text) {
+  const date = extractDateFromText(text);
+  if (!date) return null;
+  const timeMatch = text.match(/\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?\b/);
+  if (timeMatch) {
+    let hour = Number(timeMatch[1]);
+    const minute = Number(timeMatch[2]);
+    const second = timeMatch[3] ? Number(timeMatch[3]) : 0;
+    const ampm = timeMatch[4] ? timeMatch[4].toLowerCase() : null;
+    if (ampm === "pm" && hour < 12) hour += 12;
+    if (ampm === "am" && hour === 12) hour = 0;
+    if (hour <= 23 && minute <= 59 && second <= 59) {
+      const combined = new Date(date.getFullYear(), date.getMonth(), date.getDate(), hour, minute, second);
+      return { date: combined, precise: true };
+    }
+  }
+  return { date: date, precise: false };
+}
+
+// A receipt dated/timed before its own reference was ever issued is a
+// strong signal of a reused/old screenshot being passed off against a
+// fresh order. If we found a precise date+time on the receipt, compare
+// it directly against the exact moment the reference was issued. If we
+// only found a bare date (extractDateFromText alone defaults to
+// midnight), comparing at that exact-timestamp precision would wrongly
+// fail a perfectly legitimate payment made later the SAME day the
+// reference was issued -- so a date-only match is instead compared at
+// calendar-day granularity, only failing if the receipt's date is from
+// a day strictly before the reference was issued. Either way, if no
+// receipt date can be found at all, or the reference's issued-at time
+// is unknown (sheet missing / reference not found -- the separate
+// !refIssued fraud path already covers that case), this isn't enforced.
+function checkPaymentAfterReference(ocrText, referenceIssuedAt) {
+  if (!referenceIssuedAt) return { ok: true, note: "reference issued time unknown" };
+  const receiptDateTime = extractDateTimeFromText(ocrText);
+  if (!receiptDateTime) return { ok: true, note: "no receipt date/time detected" };
+
+  if (receiptDateTime.precise) {
+    return receiptDateTime.date >= referenceIssuedAt
+      ? { ok: true, note: "after reference issued" }
+      : { ok: false, note: "receipt predates the moment the reference was issued" };
+  }
+
+  const receiptDay = new Date(receiptDateTime.date.getFullYear(), receiptDateTime.date.getMonth(), receiptDateTime.date.getDate());
+  const issuedDay = new Date(referenceIssuedAt.getFullYear(), referenceIssuedAt.getMonth(), referenceIssuedAt.getDate());
+  return receiptDay >= issuedDay
+    ? { ok: true, note: "same day or after (date-only match)" }
+    : { ok: false, note: "receipt date is before the day the reference was issued" };
 }
 
 // ---- Screenshot storage + OCR ----
@@ -1399,8 +1671,8 @@ function createDailyDigestTrigger() {
 // Free, rule-based triage over recently Rejected rows -- no AI/paid API
 // involved. Each row's OCR Notes already records which individual checks
 // passed/failed (Ref, Cost, Acct, Success word, Bank name, Recency,
-// BankRefSeq); this counts how many of those actually failed on a row
-// and buckets it:
+// ReceiptNumber, PaymentAfterReference, ImageEdited); this counts how
+// many of those actually failed on a row and buckets it:
 //   - exactly one check failed -> "Close call" -- everything else about
 //     the payment matched, so it's the most likely spot for a genuine
 //     payment to have been wrongly rejected (e.g. missed the 1-hour
@@ -1418,7 +1690,9 @@ const FAILED_CHECK_PATTERNS = [
   { label: "Success wording", failedIf: /Success word:false/ },
   { label: "Bank name", failedIf: /Bank name:false/ },
   { label: "Transaction recency", failedIf: /Recency:false/ },
-  { label: "Bank reference sequence", failedIf: /BankRefSeq:\d+ \(<= last seen/ },
+  { label: "Receipt/transaction number", failedIf: /ReceiptNumber:false/ },
+  { label: "Payment timing vs reference issued", failedIf: /PaymentAfterReference:false/ },
+  { label: "Edited image / screenshot shape", failedIf: /ImageOk:false/ },
 ];
 
 function classifyRejectedRow(ocrNotes) {
