@@ -50,19 +50,32 @@
   #status { margin-top: 14px; font-size: 0.9rem; text-align: center; }
   #status.error { color: var(--error); }
   #status.success { color: var(--success); }
-  .photo-preview {
-    width: 100%; max-height: 220px; object-fit: contain; border-radius: 8px;
-    border: 1px solid var(--border); margin-top: 12px; display: none;
+  .secondary-btn {
+    display: block; width: 100%; padding: 12px; border-radius: 8px; font-size: 0.95rem;
+    background: #fff; border: 1px solid var(--accent); color: var(--accent); font-weight: 600; margin-top: 10px;
   }
-  .photo-preview.show { display: block; }
-  .ocr-status { font-size: 0.85rem; color: var(--muted); margin-top: 8px; text-align: center; }
-  details.raw-ocr {
-    margin-top: 12px; font-size: 0.8rem; color: var(--muted);
+  .secondary-btn:hover { background: #f5f3ff; }
+  .batch-list { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .batch-row {
+    display: flex; gap: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+    align-items: flex-start; position: relative;
   }
-  details.raw-ocr pre {
+  .batch-thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; flex-shrink: 0; background: var(--bg); }
+  .batch-fields { flex: 1; min-width: 0; }
+  .batch-fields input[type="text"], .batch-fields select { margin: 4px 0; padding: 8px 10px; font-size: 0.9rem; }
+  .batch-status { font-size: 0.8rem; margin-top: 4px; }
+  .batch-status.ok { color: var(--success); }
+  .batch-status.error, .batch-status.flagged { color: var(--error); }
+  .batch-remove {
+    position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; border-radius: 50%;
+    border: none; background: var(--bg); color: var(--muted); font-size: 1rem; line-height: 1; cursor: pointer;
+  }
+  .batch-row details { margin-top: 4px; font-size: 0.75rem; color: var(--muted); }
+  .batch-row details pre {
     white-space: pre-wrap; word-break: break-word; background: var(--bg);
-    border-radius: 6px; padding: 8px; margin-top: 6px; max-height: 140px; overflow-y: auto;
+    border-radius: 6px; padding: 6px; max-height: 100px; overflow-y: auto;
   }
+  .batch-summary { font-size: 0.85rem; text-align: center; margin-top: 10px; color: var(--muted); }
   .back-link { display: inline-block; margin-top: 20px; font-size: 0.85rem; color: var(--accent); text-decoration: none; }
   .install-banner {
     position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
@@ -94,33 +107,17 @@
 
   <div id="restock-tool" class="hidden">
     <h1>Voucher Restock</h1>
-    <p class="subtitle">Photograph a voucher card, check the extracted code/amount, then add it.</p>
+    <p class="subtitle">Photograph one or more voucher cards, check each extracted code/amount, then add them all.</p>
 
-    <label for="voucher-photo">Voucher photo</label>
     <button type="button" class="primary-btn" id="take-photo-btn" style="margin-top: 0;">Take Photo</button>
     <input type="file" id="voucher-photo" accept="image/*" capture="environment" class="hidden">
-    <img id="photo-preview" class="photo-preview" alt="Voucher photo preview">
-    <div class="ocr-status" id="ocr-status"></div>
+    <button type="button" class="secondary-btn" id="choose-photos-btn">Choose From Gallery</button>
+    <input type="file" id="voucher-photos-multi" accept="image/*" multiple class="hidden">
 
-    <label for="code-input">Voucher code</label>
-    <input type="text" id="code-input" autocomplete="off">
+    <div class="batch-list" id="batch-list"></div>
+    <div class="batch-summary" id="batch-summary"></div>
 
-    <label for="amount-input">Amount ($)</label>
-    <select id="amount-input">
-      <option value="">Select amount</option>
-      <option value="2">$2</option>
-      <option value="3">$3</option>
-      <option value="6">$6</option>
-      <option value="10">$10</option>
-      <option value="20">$20</option>
-    </select>
-
-    <details class="raw-ocr" id="raw-ocr-details">
-      <summary>Raw OCR text (if the fields above look wrong)</summary>
-      <pre id="raw-ocr-text"></pre>
-    </details>
-
-    <button type="button" class="primary-btn" id="add-voucher-btn">Add Voucher</button>
+    <button type="button" class="primary-btn" id="add-all-btn">Add All</button>
     <div id="status"></div>
   </div>
 
@@ -202,136 +199,281 @@
     }
   });
 
+  const VALID_AMOUNTS = [2, 3, 6, 10, 20];
+
   const takePhotoBtn = document.getElementById("take-photo-btn");
   const voucherPhotoInput = document.getElementById("voucher-photo");
-  const photoPreview = document.getElementById("photo-preview");
-  const ocrStatus = document.getElementById("ocr-status");
-  const codeInput = document.getElementById("code-input");
-  const amountInput = document.getElementById("amount-input");
-  const rawOcrText = document.getElementById("raw-ocr-text");
+  const choosePhotosBtn = document.getElementById("choose-photos-btn");
+  const voucherPhotosMultiInput = document.getElementById("voucher-photos-multi");
+  const batchListEl = document.getElementById("batch-list");
+  const batchSummaryEl = document.getElementById("batch-summary");
   const statusEl = document.getElementById("status");
-  const addVoucherBtn = document.getElementById("add-voucher-btn");
+  const addAllBtn = document.getElementById("add-all-btn");
+
+  // Each entry is one card row in the review list: { id, thumb (data URL),
+  // code, amount (string -- matches a <select> value), status
+  // "pending"|"added"|"error"|"flagged", message, rawText }. Nothing here
+  // touches the backend until "Add All" is clicked.
+  let batch = [];
+  let batchSeq = 0;
 
   takePhotoBtn.addEventListener("click", () => voucherPhotoInput.click());
+  choosePhotosBtn.addEventListener("click", () => voucherPhotosMultiInput.click());
 
-  voucherPhotoInput.addEventListener("change", () => {
+  voucherPhotoInput.addEventListener("change", async () => {
     const file = voucherPhotoInput.files[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      photoPreview.src = reader.result;
-      photoPreview.classList.add("show");
-    };
-    reader.readAsDataURL(file);
-
-    runVoucherOcr(file);
+    voucherPhotoInput.value = ""; // lets a repeat camera tap re-fire "change"
+    if (file) await addPhotoToBatch(file);
   });
 
-  // Best-effort extraction only -- the admin always reviews/edits before
-  // submitting. Amount: first "$12.34"-style match. Code: the longest
-  // contiguous alphanumeric run of 6+ characters (voucher/PIN codes are
-  // typically the most distinctive long token printed on a scratch card).
-  async function runVoucherOcr(file) {
-    codeInput.value = "";
-    amountInput.value = "";
-    rawOcrText.textContent = "";
+  voucherPhotosMultiInput.addEventListener("change", async () => {
+    const files = Array.from(voucherPhotosMultiInput.files || []);
+    voucherPhotosMultiInput.value = "";
+    for (const file of files) await addPhotoToBatch(file);
+  });
+
+  function readAsDataUrl(file) {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => resolve("");
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  // Best-effort extraction only -- the admin always reviews/edits every row
+  // before "Add All" writes anything. A photo usually shows one card (one
+  // code), but sometimes shows several laid out together -- splitIntoCards()
+  // below can turn one photo into several batch rows, pairing a detected
+  // code with a detected dollar amount only when that pairing is
+  // unambiguous; otherwise it leaves the amount blank and flags the row
+  // rather than guessing which amount belongs to which code.
+  async function addPhotoToBatch(file) {
+    const thumb = await readAsDataUrl(file);
     statusEl.textContent = "";
     statusEl.className = "";
 
     if (typeof Tesseract === "undefined") {
-      ocrStatus.textContent = "OCR unavailable -- enter the code and amount manually.";
+      batch.push({
+        id: ++batchSeq, thumb, code: "", amount: "",
+        status: "flagged", message: "OCR unavailable -- enter manually.", rawText: "",
+      });
+      renderBatch();
       return;
     }
 
-    ocrStatus.textContent = "Reading photo…";
+    const placeholder = { id: ++batchSeq, thumb, code: "", amount: "", status: "pending", message: "Reading photo…", rawText: "" };
+    batch.push(placeholder);
+    renderBatch();
+
     try {
       const result = await Tesseract.recognize(file, "eng");
       const text = (result && result.data && result.data.text) || "";
-      rawOcrText.textContent = text.trim() || "(no text found)";
+      const cards = splitIntoCards(text);
+      const idx = batch.indexOf(placeholder);
+      if (idx !== -1) batch.splice(idx, 1); // replace the placeholder with 1+ real rows
 
-      // Snap to the nearest valid denomination -- the dropdown only offers
-      // 2/3/6/10/20, so an OCR read like "$10.00" needs rounding down to
-      // "10" to actually match an <option> value.
-      const VALID_AMOUNTS = [2, 3, 6, 10, 20];
-      const amountMatch = text.match(/\$\s?(\d{1,4}(?:\.\d{2})?)/);
-      if (amountMatch) {
-        const read = Number(amountMatch[1]);
-        const closest = VALID_AMOUNTS.reduce((a, b) =>
-          Math.abs(b - read) < Math.abs(a - read) ? b : a
-        );
-        amountInput.value = String(closest);
-      }
-
-      const codeMatches = text.match(/[A-Z0-9]{6,}/gi) || [];
-      if (codeMatches.length) {
-        const longest = codeMatches.reduce((a, b) => (b.length > a.length ? b : a));
-        codeInput.value = longest;
-      }
-
-      ocrStatus.textContent = "Check the fields below before adding.";
+      cards.forEach((card) => {
+        batch.push({
+          id: ++batchSeq, thumb, code: card.code, amount: card.amount,
+          status: card.flagged ? "flagged" : "pending",
+          message: card.flagged ? card.flagMessage : "",
+          rawText: text.trim(),
+        });
+      });
     } catch (err) {
-      ocrStatus.textContent = "Couldn't read the photo -- enter the code and amount manually.";
+      const idx = batch.indexOf(placeholder);
+      if (idx !== -1) {
+        placeholder.status = "flagged";
+        placeholder.message = "Couldn't read the photo -- enter manually.";
+      }
     }
+    renderBatch();
   }
 
-  addVoucherBtn.addEventListener("click", async () => {
-    const code = codeInput.value.trim();
-    const amount = Number(amountInput.value);
+  // Snaps an OCR-read dollar figure to the nearest valid denomination --
+  // the dropdown only offers 2/3/6/10/20, so a read like "$10.00" needs
+  // rounding to "10" to actually match an <option> value.
+  function snapToValidAmount(read) {
+    return VALID_AMOUNTS.reduce((a, b) => (Math.abs(b - read) < Math.abs(a - read) ? b : a));
+  }
+
+  // Returns [{ code, amount, flagged, flagMessage }, ...] -- one entry per
+  // card this photo looks like it contains.
+  function splitIntoCards(text) {
+    const codeMatches = [...new Set(text.match(/[A-Z0-9]{6,}/gi) || [])];
+    const amountMatches = (text.match(/\$\s?\d{1,4}(?:\.\d{2})?/g) || []).map((m) =>
+      String(snapToValidAmount(Number(m.replace(/[^\d.]/g, ""))))
+    );
+
+    if (codeMatches.length === 0) {
+      return [{
+        code: "", amount: amountMatches[0] || "",
+        flagged: true, flagMessage: "Couldn't read a code -- enter manually.",
+      }];
+    }
+
+    if (codeMatches.length === 1) {
+      return [{ code: codeMatches[0], amount: amountMatches[0] || "", flagged: false, flagMessage: "" }];
+    }
+
+    // More than one code-like token -- likely several cards in one photo.
+    // Only pair codes with amounts 1:1 by order-of-appearance when the
+    // counts actually match; otherwise it's a guess, so leave every
+    // amount blank and flag the rows for a manual check instead.
+    const pairClean = amountMatches.length === codeMatches.length;
+    return codeMatches.map((code, i) => ({
+      code: code,
+      amount: pairClean ? amountMatches[i] : "",
+      flagged: !pairClean,
+      flagMessage: pairClean ? "" : "Multiple cards found on this photo -- check the amount.",
+    }));
+  }
+
+  function renderBatch() {
+    batchListEl.innerHTML = "";
+    batch.forEach((entry) => {
+      const row = document.createElement("div");
+      row.className = "batch-row";
+      row.dataset.id = entry.id;
+
+      const amountOptions = ["", "2", "3", "6", "10", "20"]
+        .map((v) => {
+          const label = v ? ("$" + v) : "Select amount";
+          const selected = String(entry.amount) === v ? " selected" : "";
+          return `<option value="${v}"${selected}>${label}</option>`;
+        })
+        .join("");
+
+      row.innerHTML = `
+        <img class="batch-thumb" src="${entry.thumb}" alt="">
+        <div class="batch-fields">
+          <input type="text" class="batch-code" value="${escapeHtml(entry.code)}" placeholder="Voucher code" autocomplete="off">
+          <select class="batch-amount">${amountOptions}</select>
+          ${entry.message ? `<div class="batch-status ${entry.status}">${escapeHtml(entry.message)}</div>` : ""}
+          ${entry.rawText ? `<details><summary>Raw OCR text</summary><pre>${escapeHtml(entry.rawText)}</pre></details>` : ""}
+        </div>
+        <button type="button" class="batch-remove" aria-label="Remove">&times;</button>
+      `;
+      batchListEl.appendChild(row);
+    });
+    updateSummary();
+  }
+
+  function updateSummary() {
+    if (batch.length === 0) {
+      batchSummaryEl.textContent = "";
+      return;
+    }
+    const added = batch.filter((b) => b.status === "added").length;
+    batchSummaryEl.textContent = `${batch.length} card${batch.length === 1 ? "" : "s"} in this batch` +
+      (added ? ` -- ${added} added so far.` : ".");
+  }
+
+  // Event delegation -- rows are rebuilt on every change, so listeners are
+  // bound once on the container instead of per-row.
+  batchListEl.addEventListener("input", (e) => {
+    const row = e.target.closest(".batch-row");
+    if (!row) return;
+    const entry = batch.find((b) => String(b.id) === row.dataset.id);
+    if (!entry) return;
+    if (e.target.classList.contains("batch-code")) entry.code = e.target.value;
+  });
+
+  batchListEl.addEventListener("change", (e) => {
+    const row = e.target.closest(".batch-row");
+    if (!row) return;
+    const entry = batch.find((b) => String(b.id) === row.dataset.id);
+    if (!entry) return;
+    if (e.target.classList.contains("batch-amount")) entry.amount = e.target.value;
+  });
+
+  batchListEl.addEventListener("click", (e) => {
+    if (!e.target.classList.contains("batch-remove")) return;
+    const row = e.target.closest(".batch-row");
+    if (!row) return;
+    batch = batch.filter((b) => String(b.id) !== row.dataset.id);
+    renderBatch();
+  });
+
+  // Submits one row at a time, in order, always awaiting the response
+  // before sending the next -- the backend's duplicate check scans the live
+  // Vouchers sheet, so submitting sequentially is what lets it catch the
+  // same code appearing twice within one batch, not just against rows from
+  // a past session. A row that fails (duplicate, bad amount, etc.) is
+  // flagged and left in the list rather than stopping the rest of the batch.
+  // A PIN failure is the one exception -- that's not a per-card problem, so
+  // it stops the batch immediately instead of repeating the same failure
+  // (and locking the PIN out) once per remaining row.
+  addAllBtn.addEventListener("click", async () => {
+    const pending = batch.filter((b) => b.status !== "added");
+    if (pending.length === 0) {
+      statusEl.textContent = "Nothing to add.";
+      statusEl.className = "error";
+      return;
+    }
+
     let pin = "";
     try { pin = sessionStorage.getItem(PIN_SESSION_KEY) || pinInput.value.trim(); } catch (e) { pin = pinInput.value.trim(); }
 
+    addAllBtn.disabled = true;
+    addAllBtn.textContent = "Adding...";
     statusEl.textContent = "";
     statusEl.className = "";
 
-    if (!code) {
-      statusEl.textContent = "Enter the voucher code.";
-      statusEl.className = "error";
-      return;
-    }
-    if (!amount || amount <= 0) {
-      statusEl.textContent = "Enter a valid amount.";
-      statusEl.className = "error";
-      return;
-    }
+    for (const entry of pending) {
+      const code = entry.code.trim();
+      const amount = Number(entry.amount);
 
-    addVoucherBtn.disabled = true;
-    addVoucherBtn.textContent = "Adding...";
-
-    try {
-      const response = await fetch(BACKEND_URL, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify({ action: "addVoucher", pin: pin, code: code, amount: amount }),
-      });
-      const result = await response.json();
-
-      if (result.status === "ok") {
-        statusEl.textContent = "Added $" + result.amount + " voucher " + result.code + ".";
-        statusEl.className = "success";
-        codeInput.value = "";
-        amountInput.value = "";
-        rawOcrText.textContent = "";
-        photoPreview.classList.remove("show");
-        voucherPhotoInput.value = "";
-        ocrStatus.textContent = "";
-      } else {
-        statusEl.textContent = result.message || "Something went wrong.";
-        statusEl.className = "error";
-        if (result.message && result.message.toLowerCase().indexOf("pin") !== -1) {
-          try { sessionStorage.removeItem(PIN_SESSION_KEY); } catch (e) {}
-          restockTool.classList.add("hidden");
-          pinGate.classList.remove("hidden");
-          pinInput.value = "";
-        }
+      if (!code || !amount) {
+        entry.status = "flagged";
+        entry.message = !code ? "Enter the voucher code." : "Select a valid amount.";
+        renderBatch();
+        continue;
       }
-    } catch (err) {
-      statusEl.textContent = "Network error -- please try again.";
-      statusEl.className = "error";
-    } finally {
-      addVoucherBtn.disabled = false;
-      addVoucherBtn.textContent = "Add Voucher";
+
+      try {
+        const response = await fetch(BACKEND_URL, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ action: "addVoucher", pin: pin, code: code, amount: amount }),
+        });
+        const result = await response.json();
+
+        if (result.status === "ok") {
+          entry.status = "added";
+          entry.message = "Added.";
+        } else {
+          entry.status = "error";
+          entry.message = result.message || "Something went wrong.";
+          if (result.message && result.message.toLowerCase().indexOf("pin") !== -1) {
+            try { sessionStorage.removeItem(PIN_SESSION_KEY); } catch (e) {}
+            restockTool.classList.add("hidden");
+            pinGate.classList.remove("hidden");
+            pinInput.value = "";
+            renderBatch();
+            break;
+          }
+        }
+      } catch (err) {
+        entry.status = "error";
+        entry.message = "Network error -- please try again.";
+      }
+      renderBatch();
     }
+
+    const stillPending = batch.filter((b) => b.status !== "added").length;
+    statusEl.textContent = stillPending
+      ? `${batch.length - stillPending} added, ${stillPending} need attention.`
+      : "All vouchers added.";
+    statusEl.className = stillPending ? "error" : "success";
+
+    addAllBtn.disabled = false;
+    addAllBtn.textContent = "Add All";
   });
 
   if ("serviceWorker" in navigator) {
