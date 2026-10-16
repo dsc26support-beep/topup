@@ -1,6 +1,32 @@
 /**
- * Kiribati recharge system — backend Web App (v35)
+ * Kiribati recharge system — backend Web App (v36)
  * ---------------------------------------------------
+ * Change from v35: two hardening fixes, prompted by comparing this file's
+ * anti-fraud design against a sibling project (Mwakete) that copied it and
+ * then went further in a few places.
+ * (1) doPost() now wraps its one-time-use checks (reference, screenshot
+ * hash, bank receipt number) and every write in ONE LockService script
+ * lock, with the reference/screenshot checks re-read fresh right before
+ * the lock's writes. Previously there was no lock at all, so two
+ * near-simultaneous submissions could each read "not used yet" on the
+ * same reference, screenshot, or receipt number before either one's
+ * write landed, letting both pass the same duplicate check. The slow
+ * work (saveScreenshot, ocrImage) and the OCR-text-only checks stay
+ * outside the lock on purpose, so honest submissions aren't serialized
+ * behind each other's OCR time -- only the sheet reads this request's
+ * own writes could actually race against moved inside it.
+ * (2) containsEditorSignature() widened from 4 editor names to 19, and
+ * now scans the last 64KB of the file as well as the first -- some
+ * editors write their tool-tag metadata as trailer data near the end of
+ * a JPEG, not just near the start, which the old start-only scan would
+ * have missed entirely.
+ * Two further ideas from the same comparison (stricter, label-aware
+ * receipt-number matching; a post-approval "seen in bank" admin check
+ * with a consequence for an unconfirmed approval) were looked at and
+ * deliberately NOT built this round -- out of scope for now, not ruled
+ * out. The voucher email itself stays instant on auto-approval, by
+ * explicit decision -- no delay was added anywhere in this change.
+ *
  * Change from v34: extractReceiptNumberFromText() now guards against a
  * non-string ocrText (e.g. calling checkReceiptNumber() with no argument
  * from the Apps Script editor's function dropdown, which passes
@@ -627,94 +653,117 @@ function doPost(e) {
     const amountMatched = amountCheck.matched;
     const tipAmount = amountCheck.tipAmount;
 
-    const receiptCheck = checkReceiptNumber(ocrText);
     const refIssued = isReferenceIssuedByUs(reference);
     const referenceIssuedAt = getReferenceIssuedAt(reference);
     const paymentAfterReferenceCheck = checkPaymentAfterReference(ocrText, referenceIssuedAt);
     const isUnsubmittedScreen = looksLikeUnsubmittedTransferScreen(ocrText);
 
-    const looksValid = refMatched && amountMatched && acctMatched &&
-      successMatched && bankMatched && recency.ok && receiptCheck.ok &&
-      !isUnsubmittedScreen && paymentAfterReferenceCheck.ok && imageCheck.ok;
+    // From here down, every one-time-use check (reference, screenshot,
+    // receipt number) gets a FRESH re-read and every write happens inside
+    // ONE script lock -- closing a race where two near-simultaneous
+    // submissions could each read "not used yet" on the same reference,
+    // screenshot, or bank receipt number before either one's write landed,
+    // letting both pass the same duplicate check. The slow work above
+    // (saveScreenshot, ocrImage) and the OCR-text-only checks stay outside
+    // the lock on purpose -- they're either too slow to serialize behind,
+    // or read nothing this request's own writes could race against.
+    const lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+    try {
+      if (isReferenceAlreadyUsed(reference)) {
+        return jsonResponse({ status: "error", message: "This reference has already been submitted." });
+      }
+      if (isScreenshotAlreadyUsed(screenshotHash)) {
+        return jsonResponse({ status: "error", message: "This screenshot has already been used for a previous submission." });
+      }
 
-    const props = PropertiesService.getScriptProperties();
-    const autoMax = Number(props.getProperty("AUTO_APPROVE_MAX") || "0");
-    const weeklyCapCheck = checkWithinWeeklyAutoApproveCap(email, topupAmount);
-    const eligibleForAuto = looksValid && refIssued && costAmount <= autoMax && weeklyCapCheck.ok;
+      const receiptCheck = checkReceiptNumber(ocrText);
 
-    // looksValid true but not eligibleForAuto means it's only being held
-    // back by AUTO_APPROVE_MAX or the weekly per-customer cap (v34) -- a
-    // legitimate "needs a human to say OK" case, so Pending Review. A
-    // small underpayment (within UNDERPAY_TOLERANCE) no longer blocks
-    // auto-approval on its own -- it still goes through like a matching
-    // payment. looksValid false means a real check failed (wrong
-    // reference, wrong account, no success/bank wording, too old, a
-    // genuine amount mismatch, a missing/reused receipt number, a
-    // receipt dated before the reference was issued, or a detected
-    // editor signature/wrong screenshot shape -- the four v34 additions)
-    // -- those are Rejected outright, not left in limbo.
-    // !refIssued overrides all of that -- the submitted reference doesn't
-    // match any code this server ever generated (via doGet/issueReference),
-    // which is a strong tampering/fraud signal. It always forces Pending
-    // Review (never silently Approved, never auto-Rejected either, in
-    // case the customer's browser just failed to fetch a server-issued
-    // one and fell back to a local one) -- see v22 changelog.
-    const rowStatus = !refIssued ? "Pending Review" :
-      (eligibleForAuto ? "Approved" : (looksValid ? "Pending Review" : "Rejected"));
+      const looksValid = refMatched && amountMatched && acctMatched &&
+        successMatched && bankMatched && recency.ok && receiptCheck.ok &&
+        !isUnsubmittedScreen && paymentAfterReferenceCheck.ok && imageCheck.ok;
 
-    const notes = [
-      "Ref:" + refMatched, "Cost:" + amountMatched, "Acct:" + acctMatched,
-      "Success word:" + successMatched, "Bank name:" + bankMatched,
-      "Not yet submitted:" + isUnsubmittedScreen,
-      "Recency:" + recency.ok + " (" + recency.note + ")",
-      "Exif:" + isLikelyPhoto,
-      "Paid:" + (amountCheck.paidAmount !== null ? amountCheck.paidAmount.toFixed(2) : "n/a"),
-      "Tip:" + tipAmount.toFixed(2),
-      "ReceiptNumber:" + receiptCheck.ok + " (" + (receiptCheck.found
-        ? (receiptCheck.duplicate ? "duplicate, already used: " + receiptCheck.receiptNumber : "OK: " + receiptCheck.receiptNumber)
-        : "not found on screenshot") + ")",
-      "PaymentAfterReference:" + paymentAfterReferenceCheck.ok + " (" + paymentAfterReferenceCheck.note + ")",
-      "ImageOk:" + imageCheck.ok + " (editor signature found:" + imageCheck.editorSignature + ", shape ok:" + imageCheck.validShape + ")",
-      "WeeklyCap:" + weeklyCapCheck.ok + " (customer total this week: $" + weeklyCapCheck.weeklyApprovedTotal.toFixed(2) +
-        " / cap $" + weeklyCapCheck.cap + ", lifetime approvals:" + weeklyCapCheck.lifetimeApprovedCount + ")",
-      "RefIssued:" + refIssued + (refIssued ? "" : " (SUSPECTED FRAUD -- reference not recognized as server-issued)"),
-    ].join(" | ");
+      const props = PropertiesService.getScriptProperties();
+      const autoMax = Number(props.getProperty("AUTO_APPROVE_MAX") || "0");
+      const weeklyCapCheck = checkWithinWeeklyAutoApproveCap(email, topupAmount);
+      const eligibleForAuto = looksValid && refIssued && costAmount <= autoMax && weeklyCapCheck.ok;
 
-    const row = appendResponseRow({
-      reference: reference, name: name, email: email,
-      topupAmount: topupAmount, costAmount: costAmount, method: method,
-      screenshotUrl: screenshotUrl, screenshotHash: screenshotHash,
-      status: rowStatus,
-      ocrNotes: notes,
-    });
+      // looksValid true but not eligibleForAuto means it's only being held
+      // back by AUTO_APPROVE_MAX or the weekly per-customer cap (v34) -- a
+      // legitimate "needs a human to say OK" case, so Pending Review. A
+      // small underpayment (within UNDERPAY_TOLERANCE) no longer blocks
+      // auto-approval on its own -- it still goes through like a matching
+      // payment. looksValid false means a real check failed (wrong
+      // reference, wrong account, no success/bank wording, too old, a
+      // genuine amount mismatch, a missing/reused receipt number, a
+      // receipt dated before the reference was issued, or a detected
+      // editor signature/wrong screenshot shape -- the four v34 additions)
+      // -- those are Rejected outright, not left in limbo.
+      // !refIssued overrides all of that -- the submitted reference doesn't
+      // match any code this server ever generated (via doGet/issueReference),
+      // which is a strong tampering/fraud signal. It always forces Pending
+      // Review (never silently Approved, never auto-Rejected either, in
+      // case the customer's browser just failed to fetch a server-issued
+      // one and fell back to a local one) -- see v22 changelog.
+      const rowStatus = !refIssued ? "Pending Review" :
+        (eligibleForAuto ? "Approved" : (looksValid ? "Pending Review" : "Rejected"));
 
-    if (!refIssued) {
-      alertSuspectedFraud(reference, name, email, topupAmount, costAmount, screenshotUrl);
-    }
+      const notes = [
+        "Ref:" + refMatched, "Cost:" + amountMatched, "Acct:" + acctMatched,
+        "Success word:" + successMatched, "Bank name:" + bankMatched,
+        "Not yet submitted:" + isUnsubmittedScreen,
+        "Recency:" + recency.ok + " (" + recency.note + ")",
+        "Exif:" + isLikelyPhoto,
+        "Paid:" + (amountCheck.paidAmount !== null ? amountCheck.paidAmount.toFixed(2) : "n/a"),
+        "Tip:" + tipAmount.toFixed(2),
+        "ReceiptNumber:" + receiptCheck.ok + " (" + (receiptCheck.found
+          ? (receiptCheck.duplicate ? "duplicate, already used: " + receiptCheck.receiptNumber : "OK: " + receiptCheck.receiptNumber)
+          : "not found on screenshot") + ")",
+        "PaymentAfterReference:" + paymentAfterReferenceCheck.ok + " (" + paymentAfterReferenceCheck.note + ")",
+        "ImageOk:" + imageCheck.ok + " (editor signature found:" + imageCheck.editorSignature + ", shape ok:" + imageCheck.validShape + ")",
+        "WeeklyCap:" + weeklyCapCheck.ok + " (customer total this week: $" + weeklyCapCheck.weeklyApprovedTotal.toFixed(2) +
+          " / cap $" + weeklyCapCheck.cap + ", lifetime approvals:" + weeklyCapCheck.lifetimeApprovedCount + ")",
+        "RefIssued:" + refIssued + (refIssued ? "" : " (SUSPECTED FRAUD -- reference not recognized as server-issued)"),
+      ].join(" | ");
 
-    if (eligibleForAuto && receiptCheck.found) {
-      recordReceiptNumberUsed(receiptCheck.receiptNumber);
-    }
-
-    if (eligibleForAuto) {
-      const result = processApprovedRow(row);
-      return jsonResponse({
-        status: result.sent ? "approved" : "pending",
-        message: result.sent ? "Auto-approved and email sent." : "Auto-approval passed but no matching vouchers left.",
-        underTolerance: amountCheck.underTolerance,
-        voucherCode: result.sent ? result.code : null,
+      const row = appendResponseRow({
+        reference: reference, name: name, email: email,
+        topupAmount: topupAmount, costAmount: costAmount, method: method,
+        screenshotUrl: screenshotUrl, screenshotHash: screenshotHash,
+        status: rowStatus,
+        ocrNotes: notes,
       });
-    }
 
-    if (rowStatus === "Rejected") {
-      return jsonResponse({
-        status: "rejected",
-        message: "We couldn't verify this payment against your submission details, so we can't proceed. " +
-          "If this seems wrong, email neirecharge@gmail.com with your reference code.",
-      });
-    }
+      if (!refIssued) {
+        alertSuspectedFraud(reference, name, email, topupAmount, costAmount, screenshotUrl);
+      }
 
-    return jsonResponse({ status: "pending", message: "Submitted for manual review." });
+      if (eligibleForAuto && receiptCheck.found) {
+        recordReceiptNumberUsed(receiptCheck.receiptNumber);
+      }
+
+      if (eligibleForAuto) {
+        const result = processApprovedRow(row);
+        return jsonResponse({
+          status: result.sent ? "approved" : "pending",
+          message: result.sent ? "Auto-approved and email sent." : "Auto-approval passed but no matching vouchers left.",
+          underTolerance: amountCheck.underTolerance,
+          voucherCode: result.sent ? result.code : null,
+        });
+      }
+
+      if (rowStatus === "Rejected") {
+        return jsonResponse({
+          status: "rejected",
+          message: "We couldn't verify this payment against your submission details, so we can't proceed. " +
+            "If this seems wrong, email neirecharge@gmail.com with your reference code.",
+        });
+      }
+
+      return jsonResponse({ status: "pending", message: "Submitted for manual review." });
+    } finally {
+      lock.releaseLock();
+    }
   } catch (err) {
     return jsonResponse({ status: "error", message: "Server error: " + err.message });
   }
@@ -916,15 +965,16 @@ function hasExifMarker(bytes) {
   return false;
 }
 
-// ---- Reject edited images (v34) ----
+// ---- Reject edited images (v34, widened v36) ----
 //
 // Two independent signals, either one fails the check:
-//  1. Editor software signature -- PicsArt, Snapseed, Canva and
-//     Photoshop all embed their name as plain ASCII in the file's
-//     EXIF "Software" tag or XMP metadata, which (like real EXIF data)
-//     sits near the start of the file, well before the pixel data --
-//     scanning the first 64KB is enough without decoding the whole
-//     image, same economy as hasExifMarker() above.
+//  1. Editor software signature -- each of these names itself as plain
+//     ASCII in the file's EXIF "Software" tag, XMP metadata, or (GIMP)
+//     a PNG text chunk. That metadata usually sits near the start of the
+//     file, well before the pixel data, but some editors write their
+//     tool tag as trailer data near the END of the file instead -- so
+//     this scans the first 64KB AND the last 64KB rather than assume
+//     it's always up front.
 //  2. Wrong shape -- a genuine phone screenshot is a tall portrait
 //     rectangle; this parses the actual pixel width/height straight out
 //     of the PNG/JPEG header (no image library needed) and rejects
@@ -932,12 +982,20 @@ function hasExifMarker(bytes) {
 //     phone aspect ratios. If the dimensions can't be determined at all
 //     (an unsupported format, or a malformed header), this half isn't
 //     enforced -- more likely an unusual encoding than a real problem.
-const EDITOR_SIGNATURES = ["picsart", "snapseed", "canva", "photoshop"];
+const EDITOR_SIGNATURES = [
+  "picsart", "snapseed", "canva", "photoshop", "lightroom", "created with gimp",
+  "pixlr", "fotor", "photodirector", "polarr", "meitu", "inshot", "photopea",
+  "paint.net", "affinity photo", "pixelmator", "facetune", "picmonkey", "photoroom",
+];
 
 function containsEditorSignature(bytes) {
   const scanLength = Math.min(bytes.length, 65536);
-  const chunk = bytes.slice(0, scanLength);
-  const text = Utilities.newBlob(chunk).getDataAsString("ISO-8859-1").toLowerCase();
+  const head = Utilities.newBlob(bytes.slice(0, scanLength)).getDataAsString("ISO-8859-1").toLowerCase();
+  const tailStart = Math.max(scanLength, bytes.length - 65536);
+  const tail = tailStart < bytes.length
+    ? Utilities.newBlob(bytes.slice(tailStart)).getDataAsString("ISO-8859-1").toLowerCase()
+    : "";
+  const text = head + tail;
   for (let i = 0; i < EDITOR_SIGNATURES.length; i++) {
     if (text.indexOf(EDITOR_SIGNATURES[i]) !== -1) return true;
   }
